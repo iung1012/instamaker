@@ -12,12 +12,14 @@ INSTAGRAM_REELS_TARGET = "instagram_reels"
 INSTAGRAM_STORIES_TARGET = "instagram_stories"
 INSTAGRAM_CAROUSEL_TARGET = "instagram_carousel"
 YOUTUBE_SHORTS_TARGET = "youtube_shorts"
+TIKTOK_TARGET = "tiktok"
 ENV_PATH = Path(__file__).resolve().parent / ".env"
 TARGET_STATE_KEYS = [
     INSTAGRAM_REELS_TARGET,
     INSTAGRAM_STORIES_TARGET,
     INSTAGRAM_CAROUSEL_TARGET,
     YOUTUBE_SHORTS_TARGET,
+    TIKTOK_TARGET,
 ]
 
 
@@ -94,6 +96,7 @@ def normalize_state(state: dict) -> dict:
     stories_outputs = by_target.get(INSTAGRAM_STORIES_TARGET)
     carousel_outputs = by_target.get(INSTAGRAM_CAROUSEL_TARGET)
     youtube_shorts_outputs = by_target.get(YOUTUBE_SHORTS_TARGET)
+    tiktok_outputs = by_target.get(TIKTOK_TARGET)
 
     if not isinstance(legacy_instagram_outputs, list):
         legacy_instagram_outputs = []
@@ -105,6 +108,8 @@ def normalize_state(state: dict) -> dict:
         carousel_outputs = []
     if not isinstance(youtube_shorts_outputs, list):
         youtube_shorts_outputs = []
+    if not isinstance(tiktok_outputs, list):
+        tiktok_outputs = []
 
     legacy_instagram = list(dict.fromkeys(legacy_instagram_outputs + legacy_published))
     if legacy_instagram and not reels_outputs:
@@ -117,6 +122,7 @@ def normalize_state(state: dict) -> dict:
         INSTAGRAM_STORIES_TARGET: stories_outputs,
         INSTAGRAM_CAROUSEL_TARGET: carousel_outputs,
         YOUTUBE_SHORTS_TARGET: youtube_shorts_outputs,
+        TIKTOK_TARGET: tiktok_outputs,
     }
 
     state["published_outputs_by_target"] = by_target
@@ -257,6 +263,33 @@ def cleanup_carousel_package(package_dir: Path, keep_published_files: bool) -> N
             file.unlink()
     package_dir.rmdir()
     print(f"Pacote de carrossel removido apos publicacao: {package_dir}")
+
+
+def purge_old_files(directory: Path, max_age_days: int = 7, dry_run: bool = False) -> int:
+    """Remove arquivos da pasta especificada cuja data de modificacao seja mais antiga que max_age_days."""
+    if not directory.exists() or not directory.is_dir() or max_age_days <= 0:
+        return 0
+
+    now = datetime.now(timezone.utc).timestamp()
+    max_age_seconds = max_age_days * 86400
+    removed_count = 0
+
+    for entry in list(directory.rglob("*")):
+        if not entry.is_file():
+            continue
+        try:
+            mtime = entry.stat().st_mtime
+            if (now - mtime) > max_age_seconds:
+                if dry_run:
+                    print(f"[dry-run] Purga por idade: {entry.name} ({max_age_days}+ dias)")
+                else:
+                    entry.unlink()
+                    print(f"Purga por idade: {entry.name} removido ({max_age_days}+ dias)")
+                removed_count += 1
+        except OSError:
+            pass
+
+    return removed_count
 
 
 def build_requested_publish_keys(publish_kind: str) -> list[str]:
@@ -425,6 +458,29 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Nao remove arquivos locais apos publicar.",
     )
+    parser.add_argument(
+        "--purge-days",
+        type=int,
+        default=int(os.getenv("PURGE_DAYS", "0")),
+        help="Remove arquivos temporarios/logs mais antigos que N dias (0 = desativado).",
+    )
+    parser.add_argument(
+        "--publish-tiktok",
+        action="store_true",
+        default=parse_bool(os.getenv("PUBLISH_TIKTOK"), False),
+        help="Publica os videos gerados tambem no TikTok.",
+    )
+    parser.add_argument(
+        "--tiktok-method",
+        choices=["cookie", "api"],
+        default=os.getenv("TIKTOK_METHOD", "cookie"),
+        help="Metodo de publicacao no TikTok: cookie (tiktok-uploader via Playwright) ou api (API Oficial).",
+    )
+    parser.add_argument(
+        "--tiktok-cookies",
+        default=os.getenv("TIKTOK_COOKIES_FILE", "tiktok_cookies.txt"),
+        help="Arquivo de cookies para o metodo de publicacao via cookies no TikTok.",
+    )
     return parser
 
 
@@ -459,13 +515,15 @@ def main() -> int:
             requested_targets.extend(build_requested_publish_keys(args.publish_kind))
         if args.publish_youtube_shorts:
             requested_targets.append(YOUTUBE_SHORTS_TARGET)
+        if args.publish_tiktok:
+            requested_targets.append(TIKTOK_TARGET)
     composed_outputs: list[Path] = []
     composed_source_names: dict[str, str] = {}
 
     if args.publish_count < 1:
         parser.error("--publish-count deve ser 1 ou maior.")
-    if not args.skip_publish and args.mode == "carousel" and args.publish_youtube_shorts:
-        parser.error("--publish-youtube-shorts esta disponivel apenas no modo reels.")
+    if not args.skip_publish and args.mode == "carousel" and (args.publish_youtube_shorts or args.publish_tiktok):
+        parser.error("--publish-youtube-shorts e --publish-tiktok estao disponiveis apenas no modo reels.")
     if not args.skip_publish and not requested_targets:
         parser.error("Nenhum destino de publicacao selecionado.")
 
@@ -481,11 +539,15 @@ def main() -> int:
             destination_names.append("instagram")
         if args.publish_youtube_shorts:
             destination_names.append("youtube_shorts")
+        if args.publish_tiktok:
+            destination_names.append(f"tiktok ({args.tiktok_method})")
         print(f"Destinos de publicacao: {', '.join(destination_names)}")
     if not args.skip_instagram:
         print(f"Formato Instagram: {args.publish_kind}")
     if args.publish_youtube_shorts:
         print(f"YouTube Shorts: privacy={args.youtube_privacy_status}")
+    if args.publish_tiktok:
+        print(f"TikTok: metodo={args.tiktok_method}")
     print(f"Maximo de publicacoes por execucao: {args.publish_count}")
 
     try:
@@ -495,6 +557,10 @@ def main() -> int:
         print("\nLimpando arquivos da execucao anterior...")
         clear_directory_contents(timeline_dir, project_dir, dry_run=args.dry_run)
         clear_directory_contents(outputs_dir, project_dir, dry_run=args.dry_run)
+        if args.purge_days > 0:
+            print(f"Executando purga por idade (>{args.purge_days} dias)...")
+            logs_dir = project_dir / "logs"
+            purge_old_files(logs_dir, max_age_days=args.purge_days, dry_run=args.dry_run)
 
         if not args.skip_scrape:
             scrape_limit = args.max_carousels if args.mode == "carousel" else args.max_compose
@@ -708,6 +774,24 @@ def main() -> int:
                                     publish_cmd.append("--made-for-kids")
                                 if args.youtube_notify_subscribers:
                                     publish_cmd.append("--notify-subscribers")
+                            elif target == TIKTOK_TARGET:
+                                if args.tiktok_method == "cookie":
+                                    publish_cmd = [
+                                        str(python_bin),
+                                        "tiktok_cookie_publisher.py",
+                                        "--video",
+                                        str(next_media),
+                                        "--cookies",
+                                        args.tiktok_cookies,
+                                    ]
+                                else:
+                                    publish_cmd = [
+                                        str(python_bin),
+                                        "tiktok_sandbox_uploader.py",
+                                        "--token-only",
+                                        "--video",
+                                        str(next_media),
+                                    ]
                             else:
                                 raise ValueError(f"Destino de publicacao desconhecido: {target}")
 

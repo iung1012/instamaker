@@ -16,8 +16,10 @@ env/
 .env.*
 !.env.example
 
-# Cookie jar do X/Twitter usado pelo scraper.
+# Cookie jar do X/Twitter e TikTok
 cookies.json
+tiktok_cookies*.txt
+*_cookies.txt
 
 # OAuth local credentials/tokens
 youtube_token.json

@@ -12,6 +12,7 @@ from automation_pipeline import (
     build_requested_publish_keys,
     clear_directory_contents,
     normalize_state,
+    purge_old_files,
 )
 from twitter_timeline_scraper import load_processed_tweet_ids
 
@@ -116,6 +117,28 @@ class AutomationPipelineHelpersTest(unittest.TestCase):
                 load_processed_tweet_ids(state_file),
                 {"2067720159784301004"},
             )
+
+    def test_purge_old_files_removes_old_files(self) -> None:
+        import os
+        import time
+
+        with TemporaryDirectory() as temp_dir:
+            target_dir = Path(temp_dir)
+            old_file = target_dir / "old_log.txt"
+            new_file = target_dir / "new_log.txt"
+
+            old_file.write_text("old", encoding="utf-8")
+            new_file.write_text("new", encoding="utf-8")
+
+            # Simular arquivo antigo alterando mtime para 10 dias atras
+            ten_days_ago = time.time() - (10 * 86400)
+            os.utime(old_file, (ten_days_ago, ten_days_ago))
+
+            removed = purge_old_files(target_dir, max_age_days=7)
+
+            self.assertEqual(removed, 1)
+            self.assertFalse(old_file.exists())
+            self.assertTrue(new_file.exists())
 
 
 if __name__ == "__main__":

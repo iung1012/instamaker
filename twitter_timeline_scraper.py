@@ -1,6 +1,9 @@
 import argparse
 import asyncio
-from playwright.async_api import async_playwright
+try:
+    from playwright.async_api import async_playwright
+except ImportError:
+    async_playwright = None
 import yt_dlp
 import os
 import json
@@ -194,6 +197,11 @@ async def goto_with_retry(page, url, retries=NAV_RETRIES, timeout_ms=NAV_TIMEOUT
     return False
 
 async def main(max_videos=MAX_VIDEOS, state_file=".automation_state.json"):
+    if async_playwright is None:
+        print("Erro: A biblioteca 'playwright' não está instalada no ambiente Python.")
+        print("Por favor, instale executando: pip install playwright")
+        return 1
+
     if not os.path.exists(COOKIES_FILE):
         print(f"Erro: Arquivo '{COOKIES_FILE}' não encontrado.")
         print("Por favor, exporte os cookies do seu navegador como 'twitter_cookies.json'.")
@@ -239,6 +247,14 @@ async def main(max_videos=MAX_VIDEOS, state_file=".automation_state.json"):
             await browser.close()
             return 1
         
+        # Validar imediatamente se o X/Twitter redirecionou para login (cookies expirados/inválidos)
+        current_url = page.url.lower()
+        if "login" in current_url or "flow/login" in current_url:
+            print("AVISO CRÍTICO: Sessão de cookies expirada ou inválida no X/Twitter.")
+            print("O navegador foi redirecionado para a página de login. Atualize o 'cookies.json'.")
+            await browser.close()
+            return 1
+
         # Esperar um pouco mais para garantir que os tweets carreguem
         await page.wait_for_timeout(5000)
         try:

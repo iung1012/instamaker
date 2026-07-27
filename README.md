@@ -242,7 +242,34 @@ Observacoes:
 - O YouTube classifica videos quadrados ou verticais de ate 3 minutos como Shorts.
 - Projetos de API nao verificados pelo Google podem ter uploads restritos a privado ate passarem por auditoria.
 
-## TikTok Sandbox
+## TikTok (Cookies ou API Oficial)
+
+O projeto suporta dois metodos de publicacao no TikTok:
+
+1. **Via Cookies (`tiktok-uploader` / Playwright)**: Nao exige conta de desenvolvedor. Basta exportar os cookies do seu navegador TikTok como `tiktok_cookies.txt` (ou `cookies.txt`).
+2. **Via API Oficial (`tiktok_sandbox_uploader.py`)**: Requer app cadastrado no *TikTok for Developers* com produtos *Login Kit* e *Content Posting API*.
+
+### Publicando via Cookies (`tiktok-uploader`)
+
+Para publicar usando cookies de sessao:
+
+```powershell
+python .\tiktok_cookie_publisher.py `
+  --video .\outputs_ig\video_final.mp4 `
+  --description "Minha legenda do TikTok" `
+  --cookies .\tiktok_cookies.txt
+```
+
+Para integrar a publicacao via cookies na pipeline automatica:
+
+```powershell
+python .\automation_pipeline.py `
+  --publish-tiktok `
+  --tiktok-method cookie `
+  --tiktok-cookies tiktok_cookies.txt
+```
+
+### Publicando via API Oficial (TikTok Sandbox)
 
 Para testar Login Kit + Direct Post no TikTok Sandbox, use o script abaixo:
 

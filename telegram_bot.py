@@ -512,10 +512,14 @@ class ProgressMessage:
 def job_keyboard(job_id: str, has_alternatives: bool) -> dict:
     rows = [
         [
-            {"text": "🚀 Publicar", "callback_data": f"pub:{job_id}"},
-            {"text": "✏️ Legenda", "callback_data": f"cap:{job_id}"},
+            {"text": "📷 Instagram", "callback_data": f"p_ig:{job_id}"},
+            {"text": "🎵 TikTok", "callback_data": f"p_tt:{job_id}"},
+            {"text": "🚀 Ambos", "callback_data": f"p_all:{job_id}"},
         ],
-        [{"text": "🗑 Descartar", "callback_data": f"del:{job_id}"}],
+        [
+            {"text": "✏️ Legenda", "callback_data": f"cap:{job_id}"},
+            {"text": "🗑 Descartar", "callback_data": f"del:{job_id}"},
+        ],
     ]
     if has_alternatives:
         rows.insert(0, [{"text": "🎭 Trocar personagem", "callback_data": f"chg:{job_id}"}])
@@ -1008,18 +1012,18 @@ class Bot:
         who = lines[-1] if lines else "Logado."
         progress.done(f"{who} — o botao Publicar agora posta direto pela sua conta.")
 
-    def publish(self, chat_id: int, job: dict) -> None:
+    def publish_instagram(self, chat_id: int, job: dict) -> bool:
         video = Path(job["video"])
         if not video.is_file():
             self.say(chat_id, "O arquivo do video sumiu. Manda o link de novo.")
-            return
+            return False
 
         session = self.project_dir / IG_SESSION_FILENAME
         if session.is_file() and not self.session_ok():
             self.say(chat_id, "⚠️ A sessao do Instagram expirou.\n"
                               "Reconecte com /cookies ou /login e clique em Publicar de novo. "
                               "O Reel continua guardado aqui.")
-            return
+            return False
 
         progress = ProgressMessage(self.token, chat_id, "Publicando no Instagram",
                                    ["Enviando o video", "Finalizando o post"])
@@ -1045,8 +1049,8 @@ class Bot:
         output = (result.stdout or "").strip()
         if result.returncode != 0:
             detail = (result.stderr or output).strip()[-500:]
-            progress.fail(f"Publicacao falhou.\n{detail}")
-            return
+            progress.fail(f"Publicacao no Instagram falhou.\n{detail}")
+            return False
 
         post_line = next(
             (line for line in output.splitlines() if "Post ID" in line), "Publicado."
@@ -1054,7 +1058,51 @@ class Bot:
         music_line = next(
             (line for line in output.splitlines() if line.startswith("Musica:")), ""
         )
-        progress.done(f"Pronto. {post_line}" + (f"\n🎵 {music_line}" if music_line else ""))
+        progress.done(f"Pronto. Instagram: {post_line}" + (f"\n🎵 {music_line}" if music_line else ""))
+        return True
+
+    def publish_tiktok(self, chat_id: int, job: dict) -> bool:
+        video = Path(job["video"])
+        if not video.is_file():
+            self.say(chat_id, "O arquivo do video sumiu. Manda o link de novo.")
+            return False
+
+        progress = ProgressMessage(self.token, chat_id, "Publicando no TikTok",
+                                   ["Enviando o video", "Finalizando o post"])
+        progress.stage(0)
+
+        tiktok_method = os.getenv("TIKTOK_METHOD", "cookie").strip().lower()
+        if tiktok_method == "cookie":
+            cmd = [
+                self.python_bin, "tiktok_cookie_publisher.py",
+                "--video", str(video),
+                "--description", job.get("caption", ""),
+            ]
+            cookies_file = os.getenv("TIKTOK_COOKIES_FILE", "tiktok_cookies.txt")
+            if (self.project_dir / cookies_file).is_file():
+                cmd.extend(["--cookies", str(self.project_dir / cookies_file)])
+        else:
+            cmd = [
+                self.python_bin, "tiktok_sandbox_uploader.py",
+                "--token-only",
+                "--video", str(video),
+            ]
+
+        result = subprocess.run(cmd, capture_output=True, text=True, cwd=str(self.project_dir))
+        output = (result.stdout or "").strip()
+        if result.returncode != 0:
+            detail = (result.stderr or output).strip()[-500:]
+            progress.fail(f"Publicacao no TikTok falhou.\n{detail}")
+            return False
+
+        progress.done("Pronto! TikTok publicado com sucesso.")
+        return True
+
+    def publish(self, chat_id: int, job: dict, destination: str = "all") -> None:
+        if destination in ("instagram", "ig", "all"):
+            self.publish_instagram(chat_id, job)
+        if destination in ("tiktok", "tt", "all"):
+            self.publish_tiktok(chat_id, job)
 
     # -- callbacks --------------------------------------------------------
     def handle_menu(self, chat_id: int, user_id: int | None, item: str) -> None:
@@ -1148,13 +1196,14 @@ class Bot:
             self.say(chat_id, "✏️ Escreve a legenda que vai no post.")
             return
 
-        if action == "pub":
+        if action in ("pub", "p_ig", "p_tt", "p_all"):
             if not (self.is_admin(user_id) or self.guests_can_publish):
                 answer_callback(self.token, cb_id, "So o dono publica.")
                 self.say(chat_id, "Voce pode montar Reels, mas a publicacao e do dono do bot.")
                 return
             answer_callback(self.token, cb_id, "Publicando...")
-            self.publish(chat_id, job)
+            dest = "ig" if action == "p_ig" else ("tt" if action == "p_tt" else "all")
+            self.publish(chat_id, job, destination=dest)
             self.jobs.pop(job_id, None)
             save_jobs(self.project_dir, self.jobs)
         elif action == "del":

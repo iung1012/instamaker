@@ -130,9 +130,11 @@ def remove_audio(video: Path) -> Path:
     """Cria uma copia do video sem a faixa de audio."""
     dest = video.with_suffix(".muted.mp4")
     ffmpeg = Path(sys.executable).parent / "ffmpeg"
+    # Em vez de remover a trilha inteira (-an), recodificamos com volume 0
+    # para garantir que o Instagram veja que existe áudio no arquivo
     result = subprocess.run(
         [str(ffmpeg), "-y", "-loglevel", "error", "-i", str(video),
-         "-c:v", "copy", "-an", str(dest)],
+         "-c:v", "copy", "-c:a", "aac", "-af", "volume=0", str(dest)],
         capture_output=True, text=True,
     )
     if result.returncode != 0 or not dest.is_file():

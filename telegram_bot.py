@@ -15,6 +15,7 @@ import re
 import shutil
 import subprocess
 import sys
+import threading
 import time
 import uuid
 from pathlib import Path
@@ -22,7 +23,7 @@ from urllib import error, parse, request
 
 import characters as character_lib
 import nethelp
-from caption_generator import generate_caption, load_dotenv
+from caption_generator import generate_caption, generate_hook, load_dotenv
 
 TELEGRAM_API = "https://api.telegram.org"
 JOBS_FILENAME = ".telegram_jobs.json"
@@ -31,6 +32,7 @@ OUTPUT_DIRNAME = "outputs_ig"
 POLL_TIMEOUT = 50
 TELEGRAM_CAPTION_LIMIT = 1024
 TELEGRAM_DOWNLOAD_LIMIT = 20 * 1024 * 1024  # limite do getFile na Bot API
+IG_SESSION_FILENAME = ".ig_session.json"
 URL_RE = re.compile(r"https?://\S+")
 
 
@@ -316,6 +318,87 @@ def build_caption_for(context_text: str, hashtags_max: int) -> tuple[str, str]:
     )
 
 
+PROGRESS_SLOTS = 12
+
+
+def render_progress(label: str, pct: float) -> str:
+    pct = max(0, min(100, int(pct)))
+    filled = round(PROGRESS_SLOTS * pct / 100)
+    return f"{'▰' * filled}{'▱' * (PROGRESS_SLOTS - filled)} {pct}%\n{label}"
+
+
+class ProgressMessage:
+    """Uma unica mensagem no chat que vira barra de progresso.
+
+    Cada etapa define um rotulo e um teto; uma thread edita a mensagem a cada
+    poucos segundos avancando na direcao do teto, entao a barra se move mesmo
+    durante as partes longas (download, render). So chega em 100% no `done`.
+    """
+
+    TICK_SECONDS = 2.5
+
+    def __init__(self, token: str, chat_id: int):
+        self.token = token
+        self.chat_id = chat_id
+        self.message_id = None
+        self.label = ""
+        self.current = 0.0
+        self.target = 0.0
+        self._last_text = ""
+        self._lock = threading.Lock()
+        self._stop = threading.Event()
+
+    def _edit(self, text: str) -> None:
+        if self.message_id is None or text == self._last_text:
+            return
+        self._last_text = text
+        try:
+            api_call(self.token, "editMessageText", {
+                "chat_id": self.chat_id, "message_id": self.message_id, "text": text,
+            })
+        except RuntimeError:
+            pass  # progresso e cosmetico: falha de edicao nunca para o fluxo
+
+    def _tick_loop(self) -> None:
+        while not self._stop.wait(self.TICK_SECONDS):
+            with self._lock:
+                step = max(0.8, (self.target - self.current) * 0.22)
+                self.current = min(self.target, self.current + step)
+                text = render_progress(self.label, self.current)
+            self._edit(text)
+
+    def stage(self, label: str, target: float) -> None:
+        """Entra numa etapa nova: atualiza o rotulo e sobe o teto da barra."""
+        with self._lock:
+            self.label = label
+            self.target = max(self.target, float(target))
+            text = render_progress(label, self.current)
+        if self.message_id is None:
+            try:
+                resp = send_message(self.token, self.chat_id, text)
+            except RuntimeError:
+                return
+            self.message_id = (resp.get("result") or {}).get("message_id")
+            self._last_text = text
+            threading.Thread(target=self._tick_loop, daemon=True).start()
+        else:
+            self._edit(text)
+
+    def done(self, label: str) -> None:
+        self._stop.set()
+        self._edit(render_progress(label, 100))
+
+    def fail(self, text: str) -> None:
+        self._stop.set()
+        if self.message_id is not None:
+            self._edit(f"⚠️ {text}")
+        else:
+            try:
+                send_message(self.token, self.chat_id, f"⚠️ {text}")
+            except RuntimeError:
+                pass
+
+
 def job_keyboard(job_id: str, has_alternatives: bool) -> dict:
     rows = [[
         {"text": "Publicar", "callback_data": f"pub:{job_id}"},
@@ -352,27 +435,41 @@ class Bot:
 
     # -- pipeline ---------------------------------------------------------
     def process_source(self, chat_id: int, source_video: Path, context_text: str,
-                       character_name: str | None = None, exclude: Path | None = None) -> None:
+                       character_name: str | None = None, exclude: Path | None = None,
+                       progress: ProgressMessage | None = None) -> None:
+        progress = progress or ProgressMessage(self.token, chat_id)
         character = character_lib.pick_character(
             self.project_dir, name=character_name, exclude=exclude
         )
         if character is None:
-            self.say(chat_id, "Nenhum personagem disponivel. Coloque videos em characters/.")
+            progress.fail("Nenhum personagem disponivel. Coloque videos em characters/.")
             return
 
         label = character_lib.character_label(character)
-        self.say(chat_id, f"Montando com o personagem: {label}...")
+
+        # Hook da faixa preta: gerado do conteudo real. Vazio deixa o
+        # compositor cair nas frases fixas dele.
+        progress.stage("Criando o hook da faixa...", 40)
+        hook, _ = generate_hook(
+            context_text,
+            profile_focus=os.getenv(
+                "PROFILE_FOCUS", "programacao, tecnologia e IA com exemplos praticos"
+            ),
+        )
 
         self.outputs.mkdir(parents=True, exist_ok=True)
         output = self.outputs / f"tg_{uuid.uuid4().hex[:12]}_final.mp4"
+        progress.stage(f"Montando o video com o {label}...", 80)
         try:
             compose_video(
-                self.project_dir, self.python_bin, source_video, character, output
+                self.project_dir, self.python_bin, source_video, character, output,
+                hook_text=hook,
             )
         except RuntimeError as exc:
-            self.say(chat_id, f"Nao consegui montar o video.\n{exc}")
+            progress.fail(f"Nao consegui montar o video.\n{exc}")
             return
 
+        progress.stage("Escrevendo a legenda...", 92)
         caption, origin = build_caption_for(context_text, self.hashtags_max)
 
         job_id = uuid.uuid4().hex[:10]
@@ -387,7 +484,13 @@ class Bot:
         }
         save_jobs(self.project_dir, self.jobs)
 
-        alternatives = len(character_lib.list_characters(self.project_dir)) > 1
+        alternatives = (
+            len(character_lib.list_characters(self.project_dir)) > 1
+            or len(character_lib.variants(
+                character_lib.entry_for(self.project_dir, character)
+            )) > 1
+        )
+        progress.stage("Enviando o video para o chat...", 98)
         try:
             send_video(
                 self.token, chat_id, output,
@@ -395,29 +498,33 @@ class Bot:
                 reply_markup=job_keyboard(job_id, alternatives),
             )
         except RuntimeError as exc:
-            self.say(chat_id, f"Video montado em {output.name}, mas o envio falhou: {exc}")
+            progress.fail(f"Video montado em {output.name}, mas o envio falhou: {exc}")
             return
 
+        progress.done("Reel pronto 👆")
         self.say(chat_id, f"Legenda que vai no post:\n\n{caption}")
 
     def handle_url(self, chat_id: int, url: str) -> None:
-        self.say(chat_id, "Baixando o video...")
+        progress = ProgressMessage(self.token, chat_id)
+        progress.stage("Baixando o video...", 22)
         try:
             source = download_from_url(url, self.downloads, self.project_dir, self.python_bin)
         except RuntimeError as exc:
-            self.say(chat_id, f"{exc}\n\nSe for post privado, confira o cookies.json.")
+            progress.fail(f"{exc}\n\nSe for post privado, confira o cookies.json.")
             return
+        progress.stage("Lendo a descricao do post...", 30)
         context = fetch_url_description(url, self.project_dir, self.python_bin)
-        self.process_source(chat_id, source, context)
+        self.process_source(chat_id, source, context, progress=progress)
 
     def handle_video_file(self, chat_id: int, file_id: str, caption_text: str) -> None:
-        self.say(chat_id, "Baixando o arquivo...")
+        progress = ProgressMessage(self.token, chat_id)
+        progress.stage("Baixando o arquivo...", 22)
         try:
             source = download_telegram_file(self.token, file_id, self.downloads)
         except RuntimeError as exc:
-            self.say(chat_id, str(exc))
+            progress.fail(str(exc))
             return
-        self.process_source(chat_id, source, caption_text or "")
+        self.process_source(chat_id, source, caption_text or "", progress=progress)
 
     def save_character_video(self, chat_id: int, file_id: str, name: str) -> None:
         clean = re.sub(r"[^a-z0-9_-]+", "_", name.strip().lower()).strip("_")
@@ -466,31 +573,58 @@ class Bot:
         )
 
     # -- publicacao -------------------------------------------------------
+    def instagram_login(self, chat_id: int, username: str, password: str) -> None:
+        progress = ProgressMessage(self.token, chat_id)
+        progress.stage("Entrando no Instagram...", 85)
+        # Credenciais via stdin: linha de comando vazaria a senha no `ps`.
+        result = subprocess.run(
+            [self.python_bin, "instagrapi_publisher.py", "--login"],
+            input=f"{username}\n{password}\n",
+            capture_output=True, text=True, cwd=str(self.project_dir),
+        )
+        if result.returncode != 0:
+            detail = (result.stderr or result.stdout or "").strip()[-400:]
+            progress.fail(f"Login falhou.\n{detail}")
+            return
+        lines = (result.stdout or "").strip().splitlines()
+        who = lines[-1] if lines else "Logado."
+        progress.done(f"{who} — o botao Publicar agora posta direto pela sua conta.")
+
     def publish(self, chat_id: int, job: dict) -> None:
         video = Path(job["video"])
         if not video.is_file():
             self.say(chat_id, "O arquivo do video sumiu. Manda o link de novo.")
             return
 
-        self.say(chat_id, "Publicando no Instagram...")
-        cmd = [
-            self.python_bin, "instagram_graph_publisher.py",
-            "--from-dir", str(video.parent),
-            "--file-name", video.name,
-            "--publish-now",
-            "--caption", job["caption"],
-        ]
+        progress = ProgressMessage(self.token, chat_id)
+        progress.stage("Publicando no Instagram...", 90)
+        session = self.project_dir / IG_SESSION_FILENAME
+        if session.is_file():
+            # Sessao de usuario/senha (instagrapi) tem prioridade sobre a Graph API.
+            cmd = [
+                self.python_bin, "instagrapi_publisher.py",
+                "--publish", str(video),
+                "--caption", job["caption"],
+            ]
+        else:
+            cmd = [
+                self.python_bin, "instagram_graph_publisher.py",
+                "--from-dir", str(video.parent),
+                "--file-name", video.name,
+                "--publish-now",
+                "--caption", job["caption"],
+            ]
         result = subprocess.run(cmd, capture_output=True, text=True, cwd=str(self.project_dir))
         output = (result.stdout or "").strip()
         if result.returncode != 0:
             detail = (result.stderr or output).strip()[-500:]
-            self.say(chat_id, f"Publicacao falhou.\n{detail}")
+            progress.fail(f"Publicacao falhou.\n{detail}")
             return
 
         post_line = next(
             (line for line in output.splitlines() if "Post ID" in line), "Publicado."
         )
-        self.say(chat_id, f"Pronto. {post_line}")
+        progress.done(f"Pronto. {post_line}")
 
     # -- callbacks --------------------------------------------------------
     def handle_callback(self, callback: dict) -> None:
@@ -561,11 +695,38 @@ class Bot:
                 "e depois o video (ou o video ja com o comando na legenda). "
                 "Repetindo com o mesmo nome, o video entra como variacao e um "
                 "deles e sorteado a cada Reel\n"
+                "/login <usuario> <senha> - conecta sua conta do Instagram para "
+                "publicar (a mensagem e apagada do chat)\n"
+                "/logout - desconecta a conta do Instagram\n"
                 "/id - mostra seu id do Telegram",
             )
             return
         if text.startswith("/id"):
             self.say(chat_id, f"Seu id: {user_id}")
+            return
+        if text.startswith("/logout"):
+            session = self.project_dir / IG_SESSION_FILENAME
+            if session.is_file():
+                session.unlink()
+                self.say(chat_id, "Sessao do Instagram apagada. Publicacao volta a exigir /login.")
+            else:
+                self.say(chat_id, "Nao havia sessao do Instagram salva.")
+            return
+        if text.startswith("/login"):
+            # A senha nao deve ficar no historico: apaga a mensagem primeiro.
+            message_id = message.get("message_id")
+            if message_id:
+                try:
+                    api_call(self.token, "deleteMessage",
+                             {"chat_id": chat_id, "message_id": message_id})
+                except RuntimeError:
+                    pass
+            parts = text.split()
+            if len(parts) != 3:
+                self.say(chat_id, "Uso: /login <usuario> <senha>\n"
+                                  "A mensagem com a senha e apagada do chat em seguida.")
+                return
+            self.instagram_login(chat_id, parts[1], parts[2])
             return
         if text.startswith("/personagens"):
             self.say(chat_id, character_lib.describe_library(self.project_dir))

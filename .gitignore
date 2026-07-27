@@ -57,3 +57,4 @@ telegram_downloads/
 !characters/
 !characters/**
 .automation_state.json
+.ig_session.json

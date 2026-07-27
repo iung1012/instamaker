@@ -141,7 +141,7 @@ def do_publish(session_path: Path, video: Path, caption: str,
             # som original e o Reel sai creditando a faixa salva.
             media = client.clip_upload_with_music(
                 video, caption, track, thumbnail=thumbnail,
-                original_volume=1.0, music_volume=0.35,
+                original_volume=0.0, music_volume=1.0,
             )
             print(f"Musica: {track.get('title')} - {track.get('display_artist')}")
         else:

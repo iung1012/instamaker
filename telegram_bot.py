@@ -33,6 +33,7 @@ POLL_TIMEOUT = 50
 TELEGRAM_CAPTION_LIMIT = 1024
 TELEGRAM_DOWNLOAD_LIMIT = 20 * 1024 * 1024  # limite do getFile na Bot API
 IG_SESSION_FILENAME = ".ig_session.json"
+GUESTS_FILENAME = ".allowed_users.json"
 URL_RE = re.compile(r"https?://\S+")
 
 
@@ -280,6 +281,28 @@ def fetch_url_description(url: str, project_dir: Path, python_bin: str) -> str:
 # Estado dos jobs pendentes
 # --------------------------------------------------------------------------
 
+def guests_path(project_dir: Path) -> Path:
+    return Path(project_dir) / GUESTS_FILENAME
+
+
+def load_guests(project_dir: Path) -> set[int]:
+    """Convidados liberados pelo dono via /autorizar (admins ficam no .env)."""
+    path = guests_path(project_dir)
+    if not path.is_file():
+        return set()
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        return {int(i) for i in data.get("guests", [])}
+    except (OSError, json.JSONDecodeError, TypeError, ValueError):
+        return set()
+
+
+def save_guests(project_dir: Path, guests: set[int]) -> None:
+    guests_path(project_dir).write_text(
+        json.dumps({"guests": sorted(guests)}, indent=2), encoding="utf-8"
+    )
+
+
 def jobs_path(project_dir: Path) -> Path:
     return Path(project_dir) / JOBS_FILENAME
 
@@ -379,35 +402,51 @@ def parse_cookie_payload(raw: str) -> dict[str, str]:
     return cookies
 
 
-PROGRESS_SLOTS = 12
-
-
-def render_progress(label: str, pct: float) -> str:
-    pct = max(0, min(100, int(pct)))
-    filled = round(PROGRESS_SLOTS * pct / 100)
-    return f"{'▰' * filled}{'▱' * (PROGRESS_SLOTS - filled)} {pct}%\n{label}"
+SPINNER_FRAMES = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
+REEL_STEPS = [
+    "Baixando o video",
+    "Criando o hook",
+    "Montando o video",
+    "Escrevendo a legenda",
+    "Enviando",
+]
 
 
 class ProgressMessage:
-    """Uma unica mensagem no chat que vira barra de progresso.
+    """Uma unica mensagem que mostra a lista de etapas se completando.
 
-    Cada etapa define um rotulo e um teto; uma thread edita a mensagem a cada
-    poucos segundos avancando na direcao do teto, entao a barra se move mesmo
-    durante as partes longas (download, render). So chega em 100% no `done`.
+    Etapa concluida ganha check, a atual gira um spinner, as futuras ficam
+    apagadas. Uma thread reedita a mensagem de tempos em tempos so para o
+    spinner girar, entao o chat continua vivo durante o render, que e a
+    parte longa.
     """
 
     TICK_SECONDS = 2.5
 
-    def __init__(self, token: str, chat_id: int):
+    def __init__(self, token: str, chat_id: int, title: str = "Montando seu Reel",
+                 steps: list[str] | None = None):
         self.token = token
         self.chat_id = chat_id
+        self.title = title
+        self.steps = list(steps or REEL_STEPS)
+        self.index = -1
         self.message_id = None
-        self.label = ""
-        self.current = 0.0
-        self.target = 0.0
+        self._frame = 0
         self._last_text = ""
         self._lock = threading.Lock()
         self._stop = threading.Event()
+
+    def _render(self) -> str:
+        spin = SPINNER_FRAMES[self._frame % len(SPINNER_FRAMES)]
+        lines = [f"🎬 {self.title}", ""]
+        for position, step in enumerate(self.steps):
+            if position < self.index:
+                lines.append(f"✅ {step}")
+            elif position == self.index:
+                lines.append(f"{spin} {step}...")
+            else:
+                lines.append(f"▫️ {step}")
+        return "\n".join(lines)
 
     def _edit(self, text: str) -> None:
         if self.message_id is None or text == self._last_text:
@@ -423,17 +462,16 @@ class ProgressMessage:
     def _tick_loop(self) -> None:
         while not self._stop.wait(self.TICK_SECONDS):
             with self._lock:
-                step = max(0.8, (self.target - self.current) * 0.22)
-                self.current = min(self.target, self.current + step)
-                text = render_progress(self.label, self.current)
+                self._frame += 1
+                text = self._render()
             self._edit(text)
 
-    def stage(self, label: str, target: float) -> None:
-        """Entra numa etapa nova: atualiza o rotulo e sobe o teto da barra."""
+    def stage(self, index: int) -> None:
+        """Marca a etapa `index` como a atual; as anteriores ficam concluidas."""
         with self._lock:
-            self.label = label
-            self.target = max(self.target, float(target))
-            text = render_progress(label, self.current)
+            self.index = index
+            self._frame += 1
+            text = self._render()
         if self.message_id is None:
             try:
                 resp = send_message(self.token, self.chat_id, text)
@@ -447,35 +485,59 @@ class ProgressMessage:
 
     def done(self, label: str) -> None:
         self._stop.set()
-        self._edit(render_progress(label, 100))
+        with self._lock:
+            self.index = len(self.steps)
+            body = self._render()
+        self._edit(f"{body}\n\n✨ {label}")
 
     def fail(self, text: str) -> None:
         self._stop.set()
+        message = f"⚠️ {text}"
         if self.message_id is not None:
-            self._edit(f"⚠️ {text}")
+            self._edit(message)
         else:
             try:
-                send_message(self.token, self.chat_id, f"⚠️ {text}")
+                send_message(self.token, self.chat_id, message)
             except RuntimeError:
                 pass
 
 
 def job_keyboard(job_id: str, has_alternatives: bool) -> dict:
     rows = [[
-        {"text": "Publicar", "callback_data": f"pub:{job_id}"},
-        {"text": "Descartar", "callback_data": f"del:{job_id}"},
+        {"text": "🚀 Publicar", "callback_data": f"pub:{job_id}"},
+        {"text": "🗑 Descartar", "callback_data": f"del:{job_id}"},
     ]]
     if has_alternatives:
-        rows.insert(0, [{"text": "Trocar personagem", "callback_data": f"chg:{job_id}"}])
+        rows.insert(0, [{"text": "🎭 Trocar personagem", "callback_data": f"chg:{job_id}"}])
+    return {"inline_keyboard": rows}
+
+
+def menu_keyboard(is_admin: bool) -> dict:
+    rows = [[
+        {"text": "🎭 Personagens", "callback_data": "menu:personagens"},
+        {"text": "❓ Ajuda", "callback_data": "menu:ajuda"},
+    ]]
+    if is_admin:
+        rows.append([
+            {"text": "👥 Usuarios", "callback_data": "menu:usuarios"},
+            {"text": "📷 Conta", "callback_data": "menu:conta"},
+        ])
     return {"inline_keyboard": rows}
 
 
 class Bot:
-    def __init__(self, token: str, project_dir: Path, allowed: set[int], python_bin: str,
-                 hashtags_max: int = 10):
+    def __init__(self, token: str, project_dir: Path, admins: set[int], python_bin: str,
+                 hashtags_max: int = 10, guests_can_publish: bool = False):
         self.token = token
         self.project_dir = Path(project_dir)
-        self.allowed = allowed
+        # Admins vem do .env e mandam no bot; convidados sao geridos no chat e
+        # nao podem se promover nem mexer na conta do Instagram.
+        self.admins = admins
+        self.guests = load_guests(self.project_dir)
+        self.guests_can_publish = guests_can_publish
+        self.use_saved_music = os.getenv("IG_USE_SAVED_MUSIC", "1").strip() not in {
+            "0", "false", "no", "nao"
+        }
         self.python_bin = python_bin
         self.hashtags_max = hashtags_max
         self.downloads = self.project_dir / DOWNLOAD_DIRNAME
@@ -495,8 +557,75 @@ class Bot:
         except RuntimeError as exc:
             print(f"Falha ao responder no chat {chat_id}: {exc}", file=sys.stderr)
 
+    @property
+    def allowed(self) -> set[int]:
+        return self.admins | self.guests
+
     def authorized(self, user_id: int | None) -> bool:
         return bool(user_id) and user_id in self.allowed
+
+    def is_admin(self, user_id: int | None) -> bool:
+        return bool(user_id) and user_id in self.admins
+
+    def welcome_text(self, user_id: int | None) -> str:
+        character = character_lib.pick_character(self.project_dir)
+        atual = character_lib.character_label(character) if character else "nenhum"
+        conta = "conectada" if (self.project_dir / IG_SESSION_FILENAME).is_file() else "nao conectada"
+        linhas = [
+            "🎬 *Reel Maker*",
+            "",
+            "Manda um *link* de video ou o *arquivo* que eu monto o Reel:",
+            "conteudo em cima, faixa com o gancho no meio, personagem embaixo.",
+            "",
+            f"🎭 Personagem: {atual}",
+        ]
+        if self.is_admin(user_id):
+            linhas.append(f"📷 Instagram: {conta}")
+        linhas += ["", "Use os botoes abaixo ou /ajuda para ver tudo."]
+        return "\n".join(linhas).replace("*", "")
+
+    def help_text(self, is_admin: bool) -> str:
+        linhas = [
+            "❓ Como usar",
+            "",
+            "Manda um link ou um arquivo de video. Quando o Reel ficar pronto,",
+            "voce recebe com os botoes Publicar, Trocar personagem e Descartar.",
+            "",
+            "🎭 Personagens",
+            "/personagens — lista a biblioteca",
+        ]
+        if is_admin:
+            linhas += [
+                "/personagem <nome> — fixa o personagem padrao",
+                "/novopersonagem <nome> — adiciona um personagem ou uma variacao:",
+                "   manda o comando e depois o video (ou o video ja com o",
+                "   comando na legenda). Com o mesmo nome, os videos viram",
+                "   variacoes sorteadas a cada Reel",
+                "",
+                "👥 Usuarios",
+                "/usuarios — quem pode usar o bot",
+                "/autorizar <id> — libera alguem (a pessoa manda /id para descobrir o dela)",
+                "/remover <id> — tira o acesso",
+                "",
+                "📷 Instagram",
+                "/login <usuario> <senha> — conecta a conta (a mensagem e apagada)",
+                "/cookies — conecta pelos cookies do navegador (JSON com o sessionid)",
+                "/logout — desconecta",
+                "",
+                "🎵 Musica",
+                "/musicas — lista os audios salvos na sua conta",
+                "/musica on|off — usar (ou nao) uma musica salva no Reel",
+            ]
+        linhas += ["", "/id — mostra seu id do Telegram"]
+        return "\n".join(linhas)
+
+    def describe_users(self) -> str:
+        lines = [f"- {uid} (dono)" for uid in sorted(self.admins)]
+        lines += [f"- {uid}" for uid in sorted(self.guests)]
+        if not lines:
+            return "Ninguem autorizado."
+        extra = "" if self.guests_can_publish else "\n\nConvidados montam Reels, mas nao publicam."
+        return "Quem pode usar o bot:\n" + "\n".join(lines) + extra
 
     # -- pipeline ---------------------------------------------------------
     def process_source(self, chat_id: int, source_video: Path, context_text: str,
@@ -514,7 +643,7 @@ class Bot:
 
         # Hook da faixa preta: gerado do conteudo real. Vazio deixa o
         # compositor cair nas frases fixas dele.
-        progress.stage("Criando o hook da faixa...", 40)
+        progress.stage(1)
         hook, _ = generate_hook(
             context_text,
             profile_focus=os.getenv(
@@ -524,7 +653,7 @@ class Bot:
 
         self.outputs.mkdir(parents=True, exist_ok=True)
         output = self.outputs / f"tg_{uuid.uuid4().hex[:12]}_final.mp4"
-        progress.stage(f"Montando o video com o {label}...", 80)
+        progress.stage(2)
         try:
             compose_video(
                 self.project_dir, self.python_bin, source_video, character, output,
@@ -534,7 +663,7 @@ class Bot:
             progress.fail(f"Nao consegui montar o video.\n{exc}")
             return
 
-        progress.stage("Escrevendo a legenda...", 92)
+        progress.stage(3)
         caption, origin = build_caption_for(context_text, self.hashtags_max)
 
         job_id = uuid.uuid4().hex[:10]
@@ -555,7 +684,7 @@ class Bot:
                 character_lib.entry_for(self.project_dir, character)
             )) > 1
         )
-        progress.stage("Enviando o video para o chat...", 98)
+        progress.stage(4)
         try:
             send_video(
                 self.token, chat_id, output,
@@ -572,19 +701,19 @@ class Bot:
 
     def handle_url(self, chat_id: int, url: str) -> None:
         progress = ProgressMessage(self.token, chat_id)
-        progress.stage("Baixando o video...", 22)
+        progress.stage(0)
         try:
             source = download_from_url(url, self.downloads, self.project_dir, self.python_bin)
         except RuntimeError as exc:
             progress.fail(f"{exc}\n\nSe for post privado, confira o cookies.json.")
             return
-        progress.stage("Lendo a descricao do post...", 30)
+        progress.stage(0)
         context = fetch_url_description(url, self.project_dir, self.python_bin)
         self.process_source(chat_id, source, context, progress=progress)
 
     def handle_video_file(self, chat_id: int, file_id: str, caption_text: str) -> None:
         progress = ProgressMessage(self.token, chat_id)
-        progress.stage("Baixando o arquivo...", 22)
+        progress.stage(0)
         try:
             source = download_telegram_file(self.token, file_id, self.downloads)
         except RuntimeError as exc:
@@ -649,8 +778,9 @@ class Bot:
             pass
 
     def instagram_login_cookies(self, chat_id: int, cookies_json: str) -> None:
-        progress = ProgressMessage(self.token, chat_id)
-        progress.stage("Entrando no Instagram com os cookies...", 85)
+        progress = ProgressMessage(self.token, chat_id, "Conectando o Instagram",
+                                   ["Validando os cookies", "Abrindo a sessao"])
+        progress.stage(0)
         result = subprocess.run(
             [self.python_bin, "instagrapi_publisher.py", "--login-cookies"],
             input=cookies_json,
@@ -665,8 +795,9 @@ class Bot:
         progress.done(f"{who} — o botao Publicar agora posta direto pela sua conta.")
 
     def instagram_login(self, chat_id: int, username: str, password: str) -> None:
-        progress = ProgressMessage(self.token, chat_id)
-        progress.stage("Entrando no Instagram...", 85)
+        progress = ProgressMessage(self.token, chat_id, "Conectando o Instagram",
+                                   ["Enviando as credenciais", "Abrindo a sessao"])
+        progress.stage(0)
         # Credenciais via stdin: linha de comando vazaria a senha no `ps`.
         result = subprocess.run(
             [self.python_bin, "instagrapi_publisher.py", "--login"],
@@ -687,8 +818,9 @@ class Bot:
             self.say(chat_id, "O arquivo do video sumiu. Manda o link de novo.")
             return
 
-        progress = ProgressMessage(self.token, chat_id)
-        progress.stage("Publicando no Instagram...", 90)
+        progress = ProgressMessage(self.token, chat_id, "Publicando no Instagram",
+                                   ["Enviando o video", "Finalizando o post"])
+        progress.stage(0)
         session = self.project_dir / IG_SESSION_FILENAME
         if session.is_file():
             # Sessao de usuario/senha (instagrapi) tem prioridade sobre a Graph API.
@@ -697,6 +829,8 @@ class Bot:
                 "--publish", str(video),
                 "--caption", job["caption"],
             ]
+            if self.use_saved_music:
+                cmd.append("--music")
         else:
             cmd = [
                 self.python_bin, "instagram_graph_publisher.py",
@@ -718,6 +852,26 @@ class Bot:
         progress.done(f"Pronto. {post_line}")
 
     # -- callbacks --------------------------------------------------------
+    def handle_menu(self, chat_id: int, user_id: int | None, item: str) -> None:
+        admin = self.is_admin(user_id)
+        if item == "personagens":
+            self.say(chat_id, "🎭 Biblioteca\n\n"
+                     + character_lib.describe_library(self.project_dir))
+        elif item == "ajuda":
+            self.say(chat_id, self.help_text(admin), menu_keyboard(admin))
+        elif item == "usuarios" and admin:
+            self.say(chat_id, "👥 " + self.describe_users())
+        elif item == "conta" and admin:
+            result = subprocess.run(
+                [self.python_bin, "instagrapi_publisher.py", "--whoami"],
+                capture_output=True, text=True, cwd=str(self.project_dir),
+            )
+            who = (result.stdout or "").strip()
+            self.say(chat_id, f"📷 Instagram: {who}" if result.returncode == 0
+                     else "📷 Nenhuma conta conectada. Use /login ou /cookies.")
+        else:
+            self.say(chat_id, "Opcao indisponivel.")
+
     def handle_callback(self, callback: dict) -> None:
         cb_id = callback.get("id")
         user_id = (callback.get("from") or {}).get("id")
@@ -730,12 +884,22 @@ class Bot:
             return
 
         action, _, job_id = data.partition(":")
+
+        if action == "menu":
+            answer_callback(self.token, cb_id)
+            self.handle_menu(chat_id, user_id, job_id)
+            return
+
         job = self.jobs.get(job_id)
         if not job:
             answer_callback(self.token, cb_id, "Esse job expirou.")
             return
 
         if action == "pub":
+            if not (self.is_admin(user_id) or self.guests_can_publish):
+                answer_callback(self.token, cb_id, "So o dono publica.")
+                self.say(chat_id, "Voce pode montar Reels, mas a publicacao e do dono do bot.")
+                return
             answer_callback(self.token, cb_id, "Publicando...")
             self.publish(chat_id, job)
             self.jobs.pop(job_id, None)
@@ -776,26 +940,84 @@ class Bot:
             )
             return
 
-        if text.startswith("/start") or text.startswith("/ajuda"):
-            self.say(
-                chat_id,
-                "Manda um link de video ou o proprio arquivo que eu monto o Reel.\n\n"
-                "/personagens - lista a biblioteca\n"
-                "/personagem <nome> - fixa o personagem padrao\n"
-                "/novopersonagem <nome> - adiciona um personagem: manda o comando "
-                "e depois o video (ou o video ja com o comando na legenda). "
-                "Repetindo com o mesmo nome, o video entra como variacao e um "
-                "deles e sorteado a cada Reel\n"
-                "/login <usuario> <senha> - conecta sua conta do Instagram para "
-                "publicar (a mensagem e apagada do chat)\n"
-                "/cookies - conecta com os cookies do navegador (JSON com o "
-                "sessionid), como texto ou arquivo .json\n"
-                "/logout - desconecta a conta do Instagram\n"
-                "/id - mostra seu id do Telegram",
-            )
+        if text.startswith("/start"):
+            self.say(chat_id, self.welcome_text(user_id),
+                     menu_keyboard(self.is_admin(user_id)))
+            return
+        if text.startswith("/ajuda") or text.startswith("/help"):
+            self.say(chat_id, self.help_text(self.is_admin(user_id)),
+                     menu_keyboard(self.is_admin(user_id)))
             return
         if text.startswith("/id"):
             self.say(chat_id, f"Seu id: {user_id}")
+            return
+
+        # -- comandos so do dono ------------------------------------------
+        admin_only = (
+            "/autorizar", "/remover", "/usuarios", "/login", "/cookies",
+            "/logout", "/novopersonagem", "/addpersonagem", "/personagem ",
+            "/musica", "/musicas",
+        )
+        if text.startswith(admin_only) or text.strip() == "/personagem":
+            if not self.is_admin(user_id):
+                self.say(chat_id, "Esse comando e so do dono do bot.")
+                return
+
+        if text.startswith("/usuarios"):
+            self.say(chat_id, self.describe_users())
+            return
+        if text.startswith("/musicas"):
+            result = subprocess.run(
+                [self.python_bin, "instagrapi_publisher.py", "--list-music"],
+                capture_output=True, text=True, cwd=str(self.project_dir),
+            )
+            listagem = (result.stdout or result.stderr or "").strip()
+            estado = "ligada" if self.use_saved_music else "desligada"
+            self.say(chat_id, f"🎵 Musica no Reel: {estado}\n\nSalvas na conta:\n{listagem}\n\n"
+                              "/musica on|off liga ou desliga.")
+            return
+        if text.startswith("/musica"):
+            escolha = text.partition(" ")[2].strip().lower()
+            if escolha in {"on", "ligar", "sim"}:
+                self.use_saved_music = True
+            elif escolha in {"off", "desligar", "nao"}:
+                self.use_saved_music = False
+            else:
+                self.say(chat_id, "Uso: /musica on  ou  /musica off")
+                return
+            estado = "ligada" if self.use_saved_music else "desligada"
+            self.say(chat_id, f"🎵 Musica no Reel: {estado}.")
+            return
+        if text.startswith("/autorizar"):
+            wanted = text.partition(" ")[2].strip()
+            if not wanted.lstrip("-").isdigit():
+                self.say(chat_id, "Uso: /autorizar <id do telegram>\n"
+                                  "A pessoa descobre o id dela mandando /id para o bot.")
+                return
+            new_id = int(wanted)
+            if new_id in self.allowed:
+                self.say(chat_id, f"{new_id} ja podia usar o bot.")
+                return
+            self.guests.add(new_id)
+            save_guests(self.project_dir, self.guests)
+            self.say(chat_id, f"{new_id} autorizado.\n\n{self.describe_users()}")
+            return
+        if text.startswith("/remover"):
+            wanted = text.partition(" ")[2].strip()
+            if not wanted.lstrip("-").isdigit():
+                self.say(chat_id, "Uso: /remover <id do telegram>")
+                return
+            old_id = int(wanted)
+            if old_id in self.admins:
+                self.say(chat_id, "Esse id e dono do bot: so da para tirar "
+                                  "no TELEGRAM_ADMIN_IDS do .env.")
+                return
+            if old_id not in self.guests:
+                self.say(chat_id, f"{old_id} nao estava autorizado.")
+                return
+            self.guests.discard(old_id)
+            save_guests(self.project_dir, self.guests)
+            self.say(chat_id, f"{old_id} removido.\n\n{self.describe_users()}")
             return
         if text.startswith("/logout"):
             session = self.project_dir / IG_SESSION_FILENAME
@@ -966,14 +1188,20 @@ def main() -> int:
         return 1
 
     project_dir = Path(args.project_dir).resolve()
-    allowed = parse_allowed_ids(os.getenv("TELEGRAM_ALLOWED_USER_IDS", ""))
+    # Sem TELEGRAM_ADMIN_IDS, quem ja estava no .env vira dono: instalacoes
+    # antigas continuam funcionando sem editar configuracao.
+    admins = parse_allowed_ids(os.getenv("TELEGRAM_ADMIN_IDS", ""))
+    if not admins:
+        admins = parse_allowed_ids(os.getenv("TELEGRAM_ALLOWED_USER_IDS", ""))
 
     bot = Bot(
         token=token,
         project_dir=project_dir,
-        allowed=allowed,
+        admins=admins,
         python_bin=args.python_bin,
         hashtags_max=args.hashtags_max,
+        guests_can_publish=os.getenv("TELEGRAM_GUESTS_CAN_PUBLISH", "0").strip()
+        in {"1", "true", "yes", "sim"},
     )
     try:
         return bot.run()

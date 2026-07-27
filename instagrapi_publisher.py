@@ -104,15 +104,51 @@ def do_whoami(session_path: Path) -> int:
     return 0
 
 
-def do_publish(session_path: Path, video: Path, caption: str) -> int:
+def pick_saved_track(client, wanted: str = "") -> dict | None:
+    """Uma das musicas que o dono salvou no Instagram (aba de audios salvos)."""
+    import random
+
+    try:
+        items = (client.music_bookmarked() or {}).get("items") or []
+    except Exception as exc:
+        print(f"Aviso: nao consegui ler as musicas salvas ({exc}).", file=sys.stderr)
+        return None
+
+    tracks = [i.get("track") for i in items if isinstance(i, dict) and i.get("track")]
+    if not tracks:
+        return None
+    if wanted:
+        alvo = wanted.strip().lower()
+        for track in tracks:
+            texto = f"{track.get('title','')} {track.get('display_artist','')}".lower()
+            if alvo in texto:
+                return track
+    return random.choice(tracks)
+
+
+def do_publish(session_path: Path, video: Path, caption: str,
+               music: bool = False, music_name: str = "") -> int:
     if not session_path.is_file():
         print("Nenhuma sessao salva. Faca /login primeiro.", file=sys.stderr)
         return 1
 
     client = build_client(session_path)
     thumbnail = make_thumbnail(video)
+    track = pick_saved_track(client, music_name) if music else None
     try:
-        media = client.clip_upload(video, caption, thumbnail=thumbnail)
+        if track:
+            # Metadata da musica sem remixar o audio local: o video mantem o
+            # som original e o Reel sai creditando a faixa salva.
+            media = client.clip_upload_with_music(
+                video, caption, track, thumbnail=thumbnail,
+                original_volume=1.0, music_volume=0.35,
+            )
+            print(f"Musica: {track.get('title')} - {track.get('display_artist')}")
+        else:
+            if music:
+                print("Aviso: nenhuma musica salva encontrada; publicando sem.",
+                      file=sys.stderr)
+            media = client.clip_upload(video, caption, thumbnail=thumbnail)
     finally:
         thumbnail.unlink(missing_ok=True)
         # o instagrapi costuma deixar um .jpg proprio ao lado do video
@@ -132,7 +168,12 @@ def main() -> int:
                         help="Loga com cookies (JSON {nome: valor} no stdin).")
     action.add_argument("--publish", metavar="VIDEO", help="Publica o video como Reel.")
     action.add_argument("--whoami", action="store_true", help="Mostra a conta da sessao.")
+    action.add_argument("--list-music", action="store_true", help="Lista as musicas salvas.")
     parser.add_argument("--caption", default="", help="Legenda do post.")
+    parser.add_argument("--music", action="store_true",
+                        help="Usa uma das musicas salvas no Instagram.")
+    parser.add_argument("--music-name", default="",
+                        help="Escolhe a musica salva pelo titulo/artista.")
     args = parser.parse_args()
 
     session_path = Path(args.session)
@@ -143,11 +184,25 @@ def main() -> int:
             return do_login_cookies(session_path)
         if args.whoami:
             return do_whoami(session_path)
+        if args.list_music:
+            if not session_path.is_file():
+                print("Nenhuma sessao salva.", file=sys.stderr)
+                return 1
+            client = build_client(session_path)
+            items = (client.music_bookmarked() or {}).get("items") or []
+            if not items:
+                print("Nenhuma musica salva. Salve audios no app do Instagram.")
+                return 0
+            for item in items:
+                track = item.get("track") or {}
+                print(f"- {track.get('title')} — {track.get('display_artist')}")
+            return 0
         video = Path(args.publish)
         if not video.is_file():
             print(f"Video nao encontrado: {video}", file=sys.stderr)
             return 1
-        return do_publish(session_path, video, args.caption)
+        return do_publish(session_path, video, args.caption,
+                          music=args.music, music_name=args.music_name)
     except Exception as exc:  # erros do instagrapi viram mensagem legivel no chat
         name = type(exc).__name__
         hint = ""

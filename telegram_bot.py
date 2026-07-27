@@ -437,15 +437,31 @@ class Bot:
         suffix = temp.suffix.lower()
         if suffix not in character_lib.MEDIA_EXTENSIONS:
             suffix = ".mp4"
-        replaced = any(base.glob(f"{clean}.*"))
-        for old in base.glob(f"{clean}.*"):
-            old.unlink(missing_ok=True)
-        shutil.move(str(temp), base / f"{clean}{suffix}")
 
-        verb = "atualizado" if replaced else "adicionado"
+        folder = base / clean
+        loose = [p for p in base.glob(f"{clean}.*") if p.is_file()]
+        if folder.is_dir() or loose:
+            # Personagem ja existe: vira (ou ja e) pasta e o video novo entra
+            # como variacao, sorteada a cada render junto com as antigas.
+            folder.mkdir(exist_ok=True)
+            for old in loose:
+                shutil.move(str(old), folder / f"{clean}_1{old.suffix.lower()}")
+            seq = 1
+            while any(folder.glob(f"{clean}_{seq}.*")):
+                seq += 1
+            shutil.move(str(temp), folder / f"{clean}_{seq}{suffix}")
+            total = len(character_lib.variants(folder))
+            headline = (
+                f"Variacao adicionada: '{clean}' agora tem {total} videos, "
+                "sorteados a cada Reel."
+            )
+        else:
+            shutil.move(str(temp), base / f"{clean}{suffix}")
+            headline = f"Personagem '{clean}' adicionado."
+
         self.say(
             chat_id,
-            f"Personagem '{clean}' {verb}.\n\nBiblioteca:\n"
+            f"{headline}\n\nBiblioteca:\n"
             f"{character_lib.describe_library(self.project_dir)}",
         )
 
@@ -542,7 +558,9 @@ class Bot:
                 "/personagens - lista a biblioteca\n"
                 "/personagem <nome> - fixa o personagem padrao\n"
                 "/novopersonagem <nome> - adiciona um personagem: manda o comando "
-                "e depois o video (ou o video ja com o comando na legenda)\n"
+                "e depois o video (ou o video ja com o comando na legenda). "
+                "Repetindo com o mesmo nome, o video entra como variacao e um "
+                "deles e sorteado a cada Reel\n"
                 "/id - mostra seu id do Telegram",
             )
             return

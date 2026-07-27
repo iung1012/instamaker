@@ -15,13 +15,24 @@ import os
 import random
 import re
 import sys
+import time
 from pathlib import Path
 from urllib import error, parse, request
 
 GEMINI_ENDPOINT = "https://generativelanguage.googleapis.com/v1beta/models"
-DEFAULT_MODEL = os.getenv("GEMINI_MODEL", "gemini-flash-latest")
+FALLBACK_MODEL = "gemini-flash-latest"
+# Lido no import so como valor de referencia. Quem chama deve usar
+# current_model(): o .env e carregado depois deste modulo, entao fixar o
+# modelo aqui ignorava silenciosamente o GEMINI_MODEL configurado.
+DEFAULT_MODEL = os.getenv("GEMINI_MODEL", FALLBACK_MODEL)
 DEFAULT_TIMEOUT = 30
 MAX_CAPTION_CHARS = 2200  # limite do Instagram
+RATE_LIMIT_RETRIES = 3
+RATE_LIMIT_WAIT_SECONDS = 20
+# Qual formato de thinkingConfig cada modelo aceita, descoberto na primeira
+# chamada. Sem isso o Gemini 2.5 gasta duas requisicoes por texto: a primeira
+# sempre morre em 400, e o free tier cobra por requisicao, nao por sucesso.
+_THINKING_STYLE: dict[str, str] = {}
 
 COMMENT_CTAS = [
     "Voce usaria isso no seu dia a dia? Comenta aqui embaixo",
@@ -30,6 +41,11 @@ COMMENT_CTAS = [
     "O que voce construiria com isso? Comenta aqui",
     "Vale a pena ou e exagero? Quero ler sua opiniao nos comentarios",
 ]
+
+
+def current_model() -> str:
+    """Modelo em uso, resolvido na hora da chamada (o .env carrega depois)."""
+    return os.getenv("GEMINI_MODEL") or FALLBACK_MODEL
 
 
 def _prefer_ipv4() -> None:
@@ -100,20 +116,19 @@ Responda somente com a legenda."""
 def call_gemini(
     prompt: str,
     api_key: str,
-    model: str = DEFAULT_MODEL,
+    model: str = "",
     timeout: int = DEFAULT_TIMEOUT,
 ) -> str:
+    # Os modelos flash pensam por padrao, e o raciocinio consome o mesmo
+    # orcamento da resposta: com thinking ligado o texto voltava cortado no
+    # meio da frase (MAX_TOKENS). O nome do campo mudou entre geracoes
+    # (thinkingLevel no 3, thinkingBudget no 2.5), por isso o config_for.
     generation_config = {
         "temperature": 0.9,
         "topP": 0.95,
         "maxOutputTokens": 800,
-        # Os modelos "flash-latest" pensam por padrao, e o raciocinio consome o
-        # mesmo orcamento da resposta: com thinking ligado o texto voltava
-        # cortado no meio da frase (MAX_TOKENS). O nome do campo mudou entre
-        # geracoes do Gemini (thinkingLevel no 3, thinkingBudget no 2.5),
-        # entao tentamos do mais novo para o mais antigo.
-        "thinkingConfig": {"thinkingLevel": "MINIMAL"},
     }
+    model = model or current_model()
     url = f"{GEMINI_ENDPOINT}/{parse.quote(model)}:generateContent"
 
     def post(config: dict) -> dict:
@@ -128,27 +143,50 @@ def call_gemini(
         with request.urlopen(req, timeout=timeout) as resp:
             return json.loads(resp.read().decode("utf-8"))
 
-    try:
-        try:
-            body = post(generation_config)
-        except error.HTTPError as exc:
-            if exc.code != 400:
-                raise
-            # Modelo mais antigo: thinkingLevel nao existe, tenta thinkingBudget.
-            legacy_config = dict(generation_config)
-            legacy_config["thinkingConfig"] = {"thinkingBudget": 0}
+    def post_with_retry(config: dict) -> dict:
+        """O free tier do Gemini e 20 requisicoes por minuto. Com a fila
+        processando varios videos em sequencia, o 429 e transitorio: esperar
+        e repetir sai muito melhor que cair no template."""
+        for attempt in range(RATE_LIMIT_RETRIES):
             try:
-                body = post(legacy_config)
-            except error.HTTPError as exc2:
-                # Sem suporte a thinkingConfig nenhum: manda sem o campo e da
-                # folga no orcamento, ja que o thinking implicito consome dele.
-                if exc2.code != 400:
+                return post(config)
+            except error.HTTPError as exc:
+                if exc.code != 429 or attempt == RATE_LIMIT_RETRIES - 1:
                     raise
-                bare_config = {
-                    k: v for k, v in generation_config.items() if k != "thinkingConfig"
-                }
-                bare_config["maxOutputTokens"] = 4000
-                body = post(bare_config)
+                espera = RATE_LIMIT_WAIT_SECONDS * (attempt + 1)
+                print(f"Gemini no limite; esperando {espera}s e tentando de novo.",
+                      file=sys.stderr)
+                time.sleep(espera)
+        raise RuntimeError("Gemini inalcancavel apos as tentativas.")
+
+    def config_for(style: str) -> dict:
+        config = {k: v for k, v in generation_config.items() if k != "thinkingConfig"}
+        if style == "level":
+            config["thinkingConfig"] = {"thinkingLevel": "MINIMAL"}
+        elif style == "budget":
+            config["thinkingConfig"] = {"thinkingBudget": 0}
+        else:
+            # Sem controle de thinking o raciocinio come o orcamento da
+            # resposta, entao o teto sobe para o texto nao voltar cortado.
+            config["maxOutputTokens"] = 4000
+        return config
+
+    # Comeca pelo formato ja conhecido deste modelo; so explora se for a
+    # primeira vez, e guarda o que funcionou para as proximas chamadas.
+    known = _THINKING_STYLE.get(model)
+    styles = [known] if known else ["level", "budget", "bare"]
+
+    try:
+        body = None
+        for position, style in enumerate(styles):
+            try:
+                body = post_with_retry(config_for(style))
+                _THINKING_STYLE[model] = style
+                break
+            except error.HTTPError as exc:
+                ultimo = position == len(styles) - 1
+                if exc.code != 400 or ultimo:
+                    raise
     except error.HTTPError as exc:
         raw = exc.read().decode("utf-8", errors="ignore")[:400]
         raise RuntimeError(f"Gemini HTTP {exc.code}: {raw}") from exc
@@ -294,7 +332,7 @@ def generate_caption(
             raw = call_gemini(
                 build_prompt(context, profile_focus, language),
                 api_key=key,
-                model=model or DEFAULT_MODEL,
+                model=model or current_model(),
                 timeout=timeout,
             )
             body = strip_model_artifacts(raw)
@@ -409,7 +447,7 @@ def generate_hook(
             raw = call_gemini(
                 build_hook_prompt(context, profile_focus, language),
                 api_key=key,
-                model=model or DEFAULT_MODEL,
+                model=model or current_model(),
                 timeout=timeout,
             )
             lines = [l.strip() for l in strip_model_artifacts(raw).splitlines() if l.strip()]
@@ -437,7 +475,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--language", default="portugues do Brasil", help="Idioma da legenda.")
     parser.add_argument("--hashtags-max", type=int, default=12, help="Quantidade de hashtags.")
-    parser.add_argument("--model", default=None, help=f"Modelo Gemini. Padrao: {DEFAULT_MODEL}")
+    parser.add_argument("--model", default=None, help="Modelo Gemini. Padrao: GEMINI_MODEL do .env")
     parser.add_argument("--timeout", type=int, default=DEFAULT_TIMEOUT, help="Timeout da chamada.")
     parser.add_argument("--no-llm", action="store_true", help="Forca o fallback, sem chamar a API.")
     return parser

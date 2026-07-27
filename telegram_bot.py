@@ -11,6 +11,7 @@ import argparse
 import json
 import mimetypes
 import os
+import queue
 import re
 import shutil
 import subprocess
@@ -35,6 +36,15 @@ TELEGRAM_DOWNLOAD_LIMIT = 20 * 1024 * 1024  # limite do getFile na Bot API
 IG_SESSION_FILENAME = ".ig_session.json"
 GUESTS_FILENAME = ".allowed_users.json"
 URL_RE = re.compile(r"https?://\S+")
+
+# Faxina: arquivos de trabalho velhos somem sozinhos. O disco e compartilhado
+# com a Evolution API e os renders sao grandes.
+CLEANUP_AFTER_DAYS = int(os.getenv("CLEANUP_AFTER_DAYS", "7"))
+CLEANUP_INTERVAL_SECONDS = 3600
+# A sessao do Instagram expira sem avisar; checamos de tempos em tempos e
+# guardamos o resultado para nao consultar a cada publicacao.
+SESSION_CHECK_INTERVAL = 6 * 3600
+SESSION_CACHE_SECONDS = 1800
 
 
 # --------------------------------------------------------------------------
@@ -403,13 +413,10 @@ def parse_cookie_payload(raw: str) -> dict[str, str]:
 
 
 SPINNER_FRAMES = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
-REEL_STEPS = [
-    "Baixando o video",
-    "Criando o hook",
-    "Montando o video",
-    "Escrevendo a legenda",
-    "Enviando",
-]
+# O fluxo tem dois tempos, separados pela aprovacao do hook: primeiro o
+# preparo (barato), depois o render (caro) so quando o texto ja esta aprovado.
+PREPARE_STEPS = ["Baixando o video", "Lendo o conteudo", "Criando o hook"]
+REEL_STEPS = ["Montando o video", "Escrevendo a legenda", "Enviando"]
 
 
 class ProgressMessage:
@@ -503,13 +510,36 @@ class ProgressMessage:
 
 
 def job_keyboard(job_id: str, has_alternatives: bool) -> dict:
-    rows = [[
-        {"text": "🚀 Publicar", "callback_data": f"pub:{job_id}"},
-        {"text": "🗑 Descartar", "callback_data": f"del:{job_id}"},
-    ]]
+    rows = [
+        [
+            {"text": "🚀 Publicar", "callback_data": f"pub:{job_id}"},
+            {"text": "✏️ Legenda", "callback_data": f"cap:{job_id}"},
+        ],
+        [{"text": "🗑 Descartar", "callback_data": f"del:{job_id}"}],
+    ]
     if has_alternatives:
         rows.insert(0, [{"text": "🎭 Trocar personagem", "callback_data": f"chg:{job_id}"}])
     return {"inline_keyboard": rows}
+
+
+def caption_keyboard(job_id: str) -> dict:
+    return {"inline_keyboard": [[
+        {"text": "🔄 Refazer", "callback_data": f"rcp:{job_id}"},
+        {"text": "✏️ Escrever a minha", "callback_data": f"wcp:{job_id}"},
+    ]]}
+
+
+def hook_keyboard(draft_id: str) -> dict:
+    return {"inline_keyboard": [
+        [
+            {"text": "✅ Usar este", "callback_data": f"hok:{draft_id}"},
+            {"text": "🔄 Refazer", "callback_data": f"rhk:{draft_id}"},
+        ],
+        [
+            {"text": "✏️ Escrever o meu", "callback_data": f"whk:{draft_id}"},
+            {"text": "🗑 Cancelar", "callback_data": f"dhk:{draft_id}"},
+        ],
+    ]}
 
 
 def menu_keyboard(is_admin: bool) -> dict:
@@ -547,6 +577,16 @@ class Bot:
         self.pending_character: dict[int, str] = {}
         # chats que pediram /cookies e ainda vao mandar o JSON
         self.pending_cookies: set[int] = set()
+        # chat_id -> ("hook"|"caption", id) enquanto esperamos o texto digitado
+        self.pending_text: dict[int, tuple[str, str]] = {}
+        # rascunhos aguardando aprovacao do hook, antes de gastar o render
+        self.drafts: dict[str, dict] = {}
+        # Uma fila com um worker: o render come CPU e a maquina tem 2 vCPU,
+        # entao processar em paralelo so faria os dois demorarem mais.
+        self.queue: queue.Queue = queue.Queue()
+        self._session_ok: bool | None = None
+        self._session_checked_at = 0.0
+        self._session_warned = False
         # chats que pediram /cookies e vao mandar o arquivo/texto em seguida
         self.pending_cookies: set[int] = set()
 
@@ -588,8 +628,13 @@ class Bot:
         linhas = [
             "❓ Como usar",
             "",
-            "Manda um link ou um arquivo de video. Quando o Reel ficar pronto,",
-            "voce recebe com os botoes Publicar, Trocar personagem e Descartar.",
+            "1. Manda um link (ou varios) ou um arquivo de video.",
+            "2. Eu mostro o gancho da faixa preta: aprova, refaz ou escreve o seu.",
+            "3. So depois eu monto o Reel — assim nao gasto render em texto ruim.",
+            "4. No Reel pronto da para trocar o personagem, mexer na legenda",
+            "   e publicar.",
+            "",
+            "/fila — o que esta em andamento",
             "",
             "🎭 Personagens",
             "/personagens — lista a biblioteca",
@@ -627,43 +672,131 @@ class Bot:
         extra = "" if self.guests_can_publish else "\n\nConvidados montam Reels, mas nao publicam."
         return "Quem pode usar o bot:\n" + "\n".join(lines) + extra
 
-    # -- pipeline ---------------------------------------------------------
-    def process_source(self, chat_id: int, source_video: Path, context_text: str,
-                       character_name: str | None = None, exclude: Path | None = None,
-                       progress: ProgressMessage | None = None) -> None:
-        progress = progress or ProgressMessage(self.token, chat_id)
-        character = character_lib.pick_character(
-            self.project_dir, name=character_name, exclude=exclude
-        )
-        if character is None:
-            progress.fail("Nenhum personagem disponivel. Coloque videos em characters/.")
+    # -- fila --------------------------------------------------------------
+    def enqueue(self, task: tuple) -> None:
+        """Coloca o trabalho na fila e avisa quantos estao na frente."""
+        waiting = self.queue.qsize()
+        self.queue.put(task)
+        if waiting:
+            chat_id = task[1]
+            self.say(chat_id, f"📥 Na fila: {waiting} trabalho(s) na frente. Ja te aviso.")
+
+    def worker_loop(self) -> None:
+        while True:
+            task = self.queue.get()
+            try:
+                self.run_task(task)
+            except Exception as exc:  # um trabalho ruim nao derruba a fila
+                print(f"Erro no worker: {exc}", file=sys.stderr)
+                try:
+                    self.say(task[1], f"⚠️ Falhou: {exc}")
+                except Exception:
+                    pass
+            finally:
+                self.queue.task_done()
+
+    def run_task(self, task: tuple) -> None:
+        kind, chat_id = task[0], task[1]
+        if kind == "url":
+            self.prepare_from_url(chat_id, task[2])
+        elif kind == "file":
+            self.prepare_from_file(chat_id, task[2], task[3])
+        elif kind == "render":
+            exclude = Path(task[3]) if len(task) > 3 and task[3] else None
+            self.render_draft(chat_id, task[2], exclude=exclude)
+
+    # -- fase 1: preparo e hook -------------------------------------------
+    def prepare_from_url(self, chat_id: int, url: str) -> None:
+        progress = ProgressMessage(self.token, chat_id, "Preparando", PREPARE_STEPS)
+        progress.stage(0)
+        try:
+            source = download_from_url(url, self.downloads, self.project_dir, self.python_bin)
+        except RuntimeError as exc:
+            progress.fail(f"{exc}\n\nSe for post privado, confira o cookies.json.")
             return
-
-        label = character_lib.character_label(character)
-
-        # Hook da faixa preta: gerado do conteudo real. Vazio deixa o
-        # compositor cair nas frases fixas dele.
         progress.stage(1)
+        context = fetch_url_description(url, self.project_dir, self.python_bin)
+        self.offer_hook(chat_id, source, context, progress)
+
+    def prepare_from_file(self, chat_id: int, file_id: str, caption_text: str) -> None:
+        progress = ProgressMessage(self.token, chat_id, "Preparando", PREPARE_STEPS)
+        progress.stage(0)
+        try:
+            source = download_telegram_file(self.token, file_id, self.downloads)
+        except RuntimeError as exc:
+            progress.fail(str(exc))
+            return
+        progress.stage(1)
+        self.offer_hook(chat_id, source, caption_text or "", progress)
+
+    def make_hook(self, context_text: str) -> str:
         hook, _ = generate_hook(
             context_text,
             profile_focus=os.getenv(
                 "PROFILE_FOCUS", "programacao, tecnologia e IA com exemplos praticos"
             ),
         )
+        return hook
 
-        self.outputs.mkdir(parents=True, exist_ok=True)
-        output = self.outputs / f"tg_{uuid.uuid4().hex[:12]}_final.mp4"
+    def offer_hook(self, chat_id: int, source: Path, context: str,
+                   progress: ProgressMessage) -> None:
+        """Mostra o hook e espera o ok: render custa ~40s, texto custa nada."""
         progress.stage(2)
+        hook = self.make_hook(context)
+        progress.done("Hook pronto — confirma abaixo")
+
+        draft_id = uuid.uuid4().hex[:10]
+        self.drafts[draft_id] = {
+            "chat_id": chat_id,
+            "source_video": str(source),
+            "context": context,
+            "hook": hook,
+            "created": time.time(),
+        }
+        self.say(chat_id, self.hook_preview(hook), hook_keyboard(draft_id))
+
+    def hook_preview(self, hook: str) -> str:
+        if not hook:
+            return ("✍️ Nao consegui tirar um gancho do conteudo.\n\n"
+                    "Se seguir assim, o video usa uma frase padrao. "
+                    "Prefiro que voce escreva a sua.")
+        return f"✍️ Gancho da faixa preta:\n\n「 {hook} 」\n\nUsa esse?"
+
+    # -- fase 2: render ----------------------------------------------------
+    def render_draft(self, chat_id: int, draft_id: str,
+                     exclude: Path | None = None) -> None:
+        draft = self.drafts.get(draft_id)
+        if not draft:
+            self.say(chat_id, "Esse rascunho expirou. Manda o link de novo.")
+            return
+
+        source_video = Path(draft["source_video"])
+        if not source_video.is_file():
+            self.say(chat_id, "O video de origem sumiu. Manda o link de novo.")
+            return
+
+        progress = ProgressMessage(self.token, chat_id, "Montando seu Reel", REEL_STEPS)
+        character = character_lib.pick_character(self.project_dir, exclude=exclude)
+        if character is None:
+            progress.fail("Nenhum personagem disponivel. Coloque videos em characters/.")
+            return
+
+        label = character_lib.character_label(character)
+        context_text = draft.get("context", "")
+        output = self.outputs / f"tg_{uuid.uuid4().hex[:12]}_final.mp4"
+        self.outputs.mkdir(parents=True, exist_ok=True)
+
+        progress.stage(0)
         try:
             compose_video(
                 self.project_dir, self.python_bin, source_video, character, output,
-                hook_text=hook,
+                hook_text=draft.get("hook", ""),
             )
         except RuntimeError as exc:
             progress.fail(f"Nao consegui montar o video.\n{exc}")
             return
 
-        progress.stage(3)
+        progress.stage(1)
         caption, origin = build_caption_for(context_text, self.hashtags_max)
 
         job_id = uuid.uuid4().hex[:10]
@@ -674,6 +807,8 @@ class Bot:
             "caption": caption,
             "context": context_text,
             "character": str(character),
+            "hook": draft.get("hook", ""),
+            "draft": draft_id,
             "created": time.time(),
         }
         save_jobs(self.project_dir, self.jobs)
@@ -684,7 +819,7 @@ class Bot:
                 character_lib.entry_for(self.project_dir, character)
             )) > 1
         )
-        progress.stage(4)
+        progress.stage(2)
         try:
             send_video(
                 self.token, chat_id, output,
@@ -697,29 +832,90 @@ class Bot:
             return
 
         progress.done("Reel pronto 👆")
-        self.say(chat_id, f"Legenda que vai no post:\n\n{caption}")
+        self.show_caption(chat_id, job_id, caption)
 
-    def handle_url(self, chat_id: int, url: str) -> None:
-        progress = ProgressMessage(self.token, chat_id)
-        progress.stage(0)
-        try:
-            source = download_from_url(url, self.downloads, self.project_dir, self.python_bin)
-        except RuntimeError as exc:
-            progress.fail(f"{exc}\n\nSe for post privado, confira o cookies.json.")
-            return
-        progress.stage(0)
-        context = fetch_url_description(url, self.project_dir, self.python_bin)
-        self.process_source(chat_id, source, context, progress=progress)
+    def show_caption(self, chat_id: int, job_id: str, caption: str) -> None:
+        self.say(chat_id, f"📝 Legenda do post:\n\n{caption}", caption_keyboard(job_id))
 
-    def handle_video_file(self, chat_id: int, file_id: str, caption_text: str) -> None:
-        progress = ProgressMessage(self.token, chat_id)
-        progress.stage(0)
-        try:
-            source = download_telegram_file(self.token, file_id, self.downloads)
-        except RuntimeError as exc:
-            progress.fail(str(exc))
-            return
-        self.process_source(chat_id, source, caption_text or "", progress=progress)
+    # -- manutencao --------------------------------------------------------
+    def protected_paths(self) -> set[str]:
+        keep = set()
+        for job in self.jobs.values():
+            keep.add(str(job.get("video", "")))
+            keep.add(str(job.get("source_video", "")))
+        for draft in self.drafts.values():
+            keep.add(str(draft.get("source_video", "")))
+        return keep
+
+    def cleanup_old_files(self) -> int:
+        """Apaga material de trabalho velho, menos o que ainda esta em uso."""
+        cutoff = time.time() - CLEANUP_AFTER_DAYS * 86400
+        keep = self.protected_paths()
+        removed = 0
+        for folder in (self.downloads, self.outputs):
+            if not folder.is_dir():
+                continue
+            for item in folder.iterdir():
+                if not item.is_file() or str(item) in keep:
+                    continue
+                try:
+                    if item.stat().st_mtime < cutoff:
+                        item.unlink()
+                        removed += 1
+                except OSError:
+                    continue
+        if removed:
+            print(f"Faxina: {removed} arquivo(s) com mais de "
+                  f"{CLEANUP_AFTER_DAYS} dias removidos.")
+        return removed
+
+    def cleanup_loop(self) -> None:
+        while True:
+            try:
+                self.cleanup_old_files()
+                self.expire_drafts()
+            except Exception as exc:
+                print(f"Faxina falhou: {exc}", file=sys.stderr)
+            time.sleep(CLEANUP_INTERVAL_SECONDS)
+
+    def expire_drafts(self) -> None:
+        cutoff = time.time() - 86400
+        for draft_id in [k for k, v in self.drafts.items() if v.get("created", 0) < cutoff]:
+            self.drafts.pop(draft_id, None)
+
+    def session_ok(self, force: bool = False) -> bool:
+        """Sessao do Instagram viva? O resultado fica em cache por 30 min."""
+        if not (self.project_dir / IG_SESSION_FILENAME).is_file():
+            return False
+        fresh = time.time() - self._session_checked_at < SESSION_CACHE_SECONDS
+        if not force and fresh and self._session_ok is not None:
+            return self._session_ok
+        result = subprocess.run(
+            [self.python_bin, "instagrapi_publisher.py", "--whoami"],
+            capture_output=True, text=True, cwd=str(self.project_dir),
+        )
+        self._session_ok = result.returncode == 0
+        self._session_checked_at = time.time()
+        return self._session_ok
+
+    def session_watch_loop(self) -> None:
+        while True:
+            time.sleep(SESSION_CHECK_INTERVAL)
+            try:
+                if not (self.project_dir / IG_SESSION_FILENAME).is_file():
+                    continue
+                if self.session_ok(force=True):
+                    self._session_warned = False
+                    continue
+                if self._session_warned:
+                    continue
+                self._session_warned = True
+                for admin in sorted(self.admins):
+                    self.say(admin, "⚠️ A sessao do Instagram expirou.\n"
+                                    "Reconecte com /cookies ou /login — sem isso "
+                                    "o botao Publicar vai falhar.")
+            except Exception as exc:
+                print(f"Checagem de sessao falhou: {exc}", file=sys.stderr)
 
     def save_character_video(self, chat_id: int, file_id: str, name: str) -> None:
         clean = re.sub(r"[^a-z0-9_-]+", "_", name.strip().lower()).strip("_")
@@ -818,10 +1014,16 @@ class Bot:
             self.say(chat_id, "O arquivo do video sumiu. Manda o link de novo.")
             return
 
+        session = self.project_dir / IG_SESSION_FILENAME
+        if session.is_file() and not self.session_ok():
+            self.say(chat_id, "⚠️ A sessao do Instagram expirou.\n"
+                              "Reconecte com /cookies ou /login e clique em Publicar de novo. "
+                              "O Reel continua guardado aqui.")
+            return
+
         progress = ProgressMessage(self.token, chat_id, "Publicando no Instagram",
                                    ["Enviando o video", "Finalizando o post"])
         progress.stage(0)
-        session = self.project_dir / IG_SESSION_FILENAME
         if session.is_file():
             # Sessao de usuario/senha (instagrapi) tem prioridade sobre a Graph API.
             cmd = [
@@ -849,7 +1051,10 @@ class Bot:
         post_line = next(
             (line for line in output.splitlines() if "Post ID" in line), "Publicado."
         )
-        progress.done(f"Pronto. {post_line}")
+        music_line = next(
+            (line for line in output.splitlines() if line.startswith("Musica:")), ""
+        )
+        progress.done(f"Pronto. {post_line}" + (f"\n🎵 {music_line}" if music_line else ""))
 
     # -- callbacks --------------------------------------------------------
     def handle_menu(self, chat_id: int, user_id: int | None, item: str) -> None:
@@ -890,9 +1095,57 @@ class Bot:
             self.handle_menu(chat_id, user_id, job_id)
             return
 
+        # -- aprovacao do hook, antes de existir job --------------------
+        if action in {"hok", "rhk", "whk", "dhk"}:
+            draft = self.drafts.get(job_id)
+            if not draft:
+                answer_callback(self.token, cb_id, "Esse rascunho expirou.")
+                return
+            if action == "hok":
+                answer_callback(self.token, cb_id, "Montando...")
+                self.enqueue(("render", chat_id, job_id))
+            elif action == "rhk":
+                answer_callback(self.token, cb_id, "Gerando outro...")
+                novo = self.make_hook(draft.get("context", ""))
+                if novo and novo != draft.get("hook"):
+                    draft["hook"] = novo
+                    self.say(chat_id, self.hook_preview(novo), hook_keyboard(job_id))
+                else:
+                    self.say(chat_id, "Saiu igual ao anterior. Escreva o seu com "
+                                      "'✏️ Escrever o meu' se quiser outro.",
+                             hook_keyboard(job_id))
+            elif action == "whk":
+                answer_callback(self.token, cb_id, "Manda o texto")
+                self.pending_text[chat_id] = ("hook", job_id)
+                self.say(chat_id, "✏️ Escreve o gancho (curto, ate ~45 caracteres).")
+            else:
+                answer_callback(self.token, cb_id, "Cancelado.")
+                Path(draft["source_video"]).unlink(missing_ok=True)
+                self.drafts.pop(job_id, None)
+                self.say(chat_id, "Cancelado.")
+            return
+
         job = self.jobs.get(job_id)
         if not job:
             answer_callback(self.token, cb_id, "Esse job expirou.")
+            return
+
+        if action == "cap":
+            answer_callback(self.token, cb_id)
+            self.say(chat_id, "📝 O que fazer com a legenda?", caption_keyboard(job_id))
+            return
+        if action == "rcp":
+            answer_callback(self.token, cb_id, "Refazendo...")
+            caption, origin = build_caption_for(job.get("context", ""), self.hashtags_max)
+            job["caption"] = caption
+            save_jobs(self.project_dir, self.jobs)
+            self.say(chat_id, f"📝 Legenda nova (via {origin}):\n\n{caption}",
+                     caption_keyboard(job_id))
+            return
+        if action == "wcp":
+            answer_callback(self.token, cb_id, "Manda o texto")
+            self.pending_text[chat_id] = ("caption", job_id)
+            self.say(chat_id, "✏️ Escreve a legenda que vai no post.")
             return
 
         if action == "pub":
@@ -919,9 +1172,16 @@ class Bot:
             Path(job["video"]).unlink(missing_ok=True)
             self.jobs.pop(job_id, None)
             save_jobs(self.project_dir, self.jobs)
-            self.process_source(
-                chat_id, source, job.get("context", ""), exclude=Path(job["character"])
-            )
+            # O hook ja foi aprovado: remonta direto, sem perguntar de novo.
+            draft_id = job.get("draft") or uuid.uuid4().hex[:10]
+            self.drafts[draft_id] = {
+                "chat_id": chat_id,
+                "source_video": str(source),
+                "context": job.get("context", ""),
+                "hook": job.get("hook", ""),
+                "created": time.time(),
+            }
+            self.enqueue(("render", chat_id, draft_id, str(job.get("character", ""))))
         else:
             answer_callback(self.token, cb_id, "Acao desconhecida.")
 
@@ -940,6 +1200,31 @@ class Bot:
             )
             return
 
+        # Texto pedido por um botao (gancho ou legenda) tem prioridade, mas
+        # um comando cancela a espera: senao o usuario fica preso no modo.
+        if chat_id in self.pending_text and text and not text.startswith("/"):
+            mode, target = self.pending_text.pop(chat_id)
+            if mode == "hook":
+                draft = self.drafts.get(target)
+                if not draft:
+                    self.say(chat_id, "Esse rascunho expirou. Manda o link de novo.")
+                    return
+                draft["hook"] = text[:80]
+                self.say(chat_id, f"✍️ Gancho definido:\n\n「 {draft['hook']} 」")
+                self.enqueue(("render", chat_id, target))
+            else:
+                job = self.jobs.get(target)
+                if not job:
+                    self.say(chat_id, "Esse Reel expirou. Monta de novo.")
+                    return
+                job["caption"] = text
+                save_jobs(self.project_dir, self.jobs)
+                self.say(chat_id, f"📝 Legenda definida:\n\n{text}",
+                         caption_keyboard(target))
+            return
+        if chat_id in self.pending_text and text.startswith("/"):
+            self.pending_text.pop(chat_id, None)
+
         if text.startswith("/start"):
             self.say(chat_id, self.welcome_text(user_id),
                      menu_keyboard(self.is_admin(user_id)))
@@ -950,6 +1235,14 @@ class Bot:
             return
         if text.startswith("/id"):
             self.say(chat_id, f"Seu id: {user_id}")
+            return
+        if text.startswith("/fila"):
+            pendentes = self.queue.qsize()
+            rascunhos = sum(1 for d in self.drafts.values() if d.get("chat_id") == chat_id)
+            prontos = sum(1 for j in self.jobs.values() if j.get("chat_id") == chat_id)
+            self.say(chat_id, f"📥 Fila: {pendentes} esperando\n"
+                              f"✍️ Aguardando seu ok no gancho: {rascunhos}\n"
+                              f"🎬 Reels prontos sem publicar: {prontos}")
             return
 
         # -- comandos so do dono ------------------------------------------
@@ -1112,12 +1405,17 @@ class Bot:
             elif pending:
                 self.save_character_video(chat_id, video["file_id"], pending)
             else:
-                self.handle_video_file(chat_id, video["file_id"], caption_text)
+                self.enqueue(("file", chat_id, video["file_id"], caption_text))
             return
 
-        match = URL_RE.search(text)
-        if match:
-            self.handle_url(chat_id, match.group(0))
+        # Varios links numa mensagem so entram todos na fila, em ordem.
+        urls = URL_RE.findall(text)
+        if urls:
+            if len(urls) > 1:
+                self.say(chat_id, f"📥 {len(urls)} links recebidos. "
+                                  "Vou montar um de cada vez.")
+            for url in urls:
+                self.enqueue(("url", chat_id, url))
             return
 
         self.say(chat_id, "Manda um link de video ou o arquivo. /ajuda mostra os comandos.")
@@ -1130,6 +1428,16 @@ class Bot:
             return 1
         username = (me.get("result") or {}).get("username")
         print(f"Bot @{username} no ar. Autorizados: {sorted(self.allowed) or 'NENHUM'}")
+
+        # O render bloqueia por ~40s: fora da thread do polling, o bot fica
+        # surdo nesse tempo e o Telegram reentrega os updates.
+        for target, name in (
+            (self.worker_loop, "worker"),
+            (self.cleanup_loop, "faxina"),
+            (self.session_watch_loop, "sessao"),
+        ):
+            threading.Thread(target=target, name=name, daemon=True).start()
+
         if not self.allowed:
             print(
                 "Aviso: TELEGRAM_ALLOWED_USER_IDS esta vazio. O bot vai recusar "

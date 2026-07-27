@@ -126,6 +126,20 @@ def pick_saved_track(client, wanted: str = "") -> dict | None:
     return random.choice(tracks)
 
 
+def remove_audio(video: Path) -> Path:
+    """Cria uma copia do video sem a faixa de audio."""
+    dest = video.with_suffix(".muted.mp4")
+    ffmpeg = Path(sys.executable).parent / "ffmpeg"
+    result = subprocess.run(
+        [str(ffmpeg), "-y", "-loglevel", "error", "-i", str(video),
+         "-c:v", "copy", "-an", str(dest)],
+        capture_output=True, text=True,
+    )
+    if result.returncode != 0 or not dest.is_file():
+        raise RuntimeError(f"Nao consegui mutar o video: {result.stderr.strip()[:200]}")
+    return dest
+
+
 def do_publish(session_path: Path, video: Path, caption: str,
                music: bool = False, music_name: str = "") -> int:
     if not session_path.is_file():
@@ -135,12 +149,13 @@ def do_publish(session_path: Path, video: Path, caption: str,
     client = build_client(session_path)
     thumbnail = make_thumbnail(video)
     track = pick_saved_track(client, music_name) if music else None
+    upload_video = video
     try:
         if track:
-            # Metadata da musica sem remixar o audio local: o video mantem o
-            # som original e o Reel sai creditando a faixa salva.
+            # O Instagram as vezes ignora original_volume=0.0, entao removemos o audio via ffmpeg
+            upload_video = remove_audio(video)
             media = client.clip_upload_with_music(
-                video, caption, track, thumbnail=thumbnail,
+                upload_video, caption, track, thumbnail=thumbnail,
                 original_volume=0.0, music_volume=1.0,
             )
             print(f"Musica: {track.get('title')} - {track.get('display_artist')}")
@@ -150,6 +165,8 @@ def do_publish(session_path: Path, video: Path, caption: str,
                       file=sys.stderr)
             media = client.clip_upload(video, caption, thumbnail=thumbnail)
     finally:
+        if upload_video != video:
+            upload_video.unlink(missing_ok=True)
         thumbnail.unlink(missing_ok=True)
         # o instagrapi costuma deixar um .jpg proprio ao lado do video
         for leftover in video.parent.glob(f"{video.stem}.thumb.jpg.*"):

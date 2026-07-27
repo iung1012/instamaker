@@ -1,0 +1,228 @@
+name: Instagram Daily Automation
+
+on:
+  schedule:
+    - cron: "17 9,12,15,18,21 * * *"
+      timezone: "America/Sao_Paulo"
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Somente testar, sem capturar ou publicar"
+        required: true
+        type: boolean
+        default: true
+      publish_count:
+        description: "Videos nesta execucao manual"
+        required: true
+        type: choice
+        options:
+          - "1"
+          - "5"
+        default: "1"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: instagram-daily-automation
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    env:
+      IG_USER_ID: ${{ secrets.IG_USER_ID }}
+      IG_ACCESS_TOKEN: ${{ secrets.IG_ACCESS_TOKEN }}
+      TWITTER_COOKIES_JSON: ${{ secrets.TWITTER_COOKIES_JSON }}
+      VPS_HOST: ${{ secrets.VPS_HOST }}
+      VPS_USER: ${{ secrets.VPS_USER }}
+      VPS_PORT: ${{ secrets.VPS_PORT }}
+      VPS_SSH_KEY: ${{ secrets.VPS_SSH_KEY }}
+      VPS_PATH: ${{ secrets.VPS_PATH }}
+      PUBLISH_YOUTUBE_SHORTS: ${{ vars.PUBLISH_YOUTUBE_SHORTS || 'false' }}
+      SKIP_INSTAGRAM: ${{ vars.SKIP_INSTAGRAM || 'false' }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Resolve runtime inputs
+        shell: bash
+        run: |
+          set -euo pipefail
+          manual_dry_run=false
+          manual_publish_count=1
+
+          if [[ "$GITHUB_EVENT_NAME" == "workflow_dispatch" ]]; then
+            manual_dry_run="$(
+              python3 -c 'import json, os; from pathlib import Path; event = json.loads(Path(os.environ["GITHUB_EVENT_PATH"]).read_text(encoding="utf-8")); value = event.get("inputs", {}).get("dry_run", False); print("true" if str(value).lower() in {"1", "true", "yes", "on"} else "false")'
+            )"
+            manual_publish_count="$(
+              python3 -c 'import json, os; from pathlib import Path; event = json.loads(Path(os.environ["GITHUB_EVENT_PATH"]).read_text(encoding="utf-8")); print(event.get("inputs", {}).get("publish_count", "1"))'
+            )"
+          fi
+
+          echo "MANUAL_DRY_RUN=$manual_dry_run" >> "$GITHUB_ENV"
+          echo "MANUAL_PUBLISH_COUNT=$manual_publish_count" >> "$GITHUB_ENV"
+
+      - name: Validate secrets
+        shell: bash
+        run: |
+          set -euo pipefail
+          missing=0
+          for name in \
+            IG_USER_ID \
+            IG_ACCESS_TOKEN \
+            TWITTER_COOKIES_JSON \
+            VPS_HOST \
+            VPS_USER \
+            VPS_PORT \
+            VPS_SSH_KEY \
+            VPS_PATH
+          do
+            if [[ -z "${!name:-}" ]]; then
+              echo "::error::Secret ausente: $name"
+              missing=1
+            fi
+          done
+
+          if ((missing)); then
+            exit 1
+          fi
+
+          [[ "$VPS_PORT" =~ ^[0-9]{1,5}$ ]] ||
+            { echo "::error::VPS_PORT deve ser numerico."; exit 1; }
+          ((VPS_PORT >= 1 && VPS_PORT <= 65535)) ||
+            { echo "::error::VPS_PORT fora do intervalo valido."; exit 1; }
+          [[ "$VPS_HOST" =~ ^[A-Za-z0-9][A-Za-z0-9.:-]*$ ]] ||
+            { echo "::error::VPS_HOST invalido."; exit 1; }
+          [[ "$VPS_USER" =~ ^[A-Za-z_][A-Za-z0-9_-]*$ ]] ||
+            { echo "::error::VPS_USER invalido."; exit 1; }
+          [[ "$VPS_PATH" =~ ^/[A-Za-z0-9._/-]+$ ]] ||
+            { echo "::error::VPS_PATH deve ser absoluto e sem espacos."; exit 1; }
+
+      - name: Configure SSH
+        shell: bash
+        run: |
+          set -euo pipefail
+          install -d -m 700 "$HOME/.ssh"
+          printf '%s\n' "$VPS_SSH_KEY" | tr -d '\r' > "$HOME/.ssh/instagram_vps"
+          chmod 600 "$HOME/.ssh/instagram_vps"
+          ssh-keygen -y -f "$HOME/.ssh/instagram_vps" >/dev/null
+
+          ssh-keyscan -p "$VPS_PORT" -H "$VPS_HOST" > "$HOME/.ssh/known_hosts"
+          test -s "$HOME/.ssh/known_hosts"
+          chmod 600 "$HOME/.ssh/known_hosts"
+
+          {
+            echo "Host instagram-vps"
+            echo "  HostName $VPS_HOST"
+            echo "  User $VPS_USER"
+            echo "  Port $VPS_PORT"
+            echo "  IdentityFile $HOME/.ssh/instagram_vps"
+            echo "  IdentitiesOnly yes"
+            echo "  BatchMode yes"
+            echo "  ConnectTimeout 20"
+            echo "  StrictHostKeyChecking yes"
+          } > "$HOME/.ssh/config"
+          chmod 600 "$HOME/.ssh/config"
+
+      - name: Test VPS connection
+        shell: bash
+        run: |
+          set -euo pipefail
+          ssh instagram-vps \
+            "printf 'SSH conectado: '; hostname; printf 'Usuario: '; whoami"
+
+      - name: Sync project to VPS
+        shell: bash
+        run: |
+          set -euo pipefail
+          tar \
+            --exclude='./.git' \
+            --exclude='./.env' \
+            --exclude='./.github-runtime' \
+            --exclude='./.automation.lock' \
+            --exclude='./.automation_state.json' \
+            --exclude='./.automation_vps.lock' \
+            --exclude='./cookies.json' \
+            --exclude='./logs' \
+            --exclude='./outputs_ig' \
+            --exclude='./timeline_downloads' \
+            --exclude='./venv' \
+            -czf - . |
+            ssh instagram-vps \
+              "set -e; umask 077; mkdir -p '$VPS_PATH'; tar -xzf - -C '$VPS_PATH'"
+
+      - name: Transfer runtime secrets
+        shell: bash
+        run: |
+          set -euo pipefail
+          runtime_dir="$RUNNER_TEMP/instagram-runtime"
+          install -d -m 700 "$runtime_dir"
+          printf '%s' "$IG_USER_ID" > "$runtime_dir/IG_USER_ID"
+          printf '%s' "$IG_ACCESS_TOKEN" > "$runtime_dir/IG_ACCESS_TOKEN"
+          printf '%s' "$TWITTER_COOKIES_JSON" > "$runtime_dir/cookies.json"
+          chmod 600 "$runtime_dir"/*
+
+          RUNTIME_DIR="$runtime_dir" python - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          path = Path(os.environ["RUNTIME_DIR"], "cookies.json")
+          cookies = json.loads(path.read_text(encoding="utf-8"))
+          if not isinstance(cookies, (dict, list)):
+              raise SystemExit(
+                  "TWITTER_COOKIES_JSON deve conter um objeto ou lista JSON"
+              )
+          path.write_text(
+              json.dumps(cookies, ensure_ascii=False, separators=(",", ":")),
+              encoding="utf-8",
+          )
+          PY
+
+          tar -C "$runtime_dir" -czf - . |
+            ssh instagram-vps \
+              "set -e; umask 077; rm -rf '$VPS_PATH/.github-runtime'; mkdir -p '$VPS_PATH/.github-runtime'; tar -xzf - -C '$VPS_PATH/.github-runtime'"
+
+      - name: Inspect VPS state
+        shell: bash
+        run: |
+          set -euo pipefail
+          ssh instagram-vps \
+            "bash '$VPS_PATH/vps_diagnostics.sh' '$VPS_PATH'"
+
+      - name: Run pipeline on VPS
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p logs
+
+          ssh instagram-vps \
+            "bash '$VPS_PATH/github_vps_runner.sh' \
+              '$VPS_PATH' \
+              '$MANUAL_PUBLISH_COUNT' \
+              '$MANUAL_DRY_RUN' \
+              '${{ github.event_name }}' \
+              '$PUBLISH_YOUTUBE_SHORTS' \
+              '$SKIP_INSTAGRAM'" 2>&1 |
+            tee "logs/vps-${GITHUB_RUN_ID}.log"
+
+      - name: Remove temporary VPS credentials
+        if: always()
+        shell: bash
+        run: |
+          if [[ -f "$HOME/.ssh/config" ]]; then
+            ssh instagram-vps "rm -rf '$VPS_PATH/.github-runtime'" || true
+          fi
+
+      - name: Upload execution log
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: instagram-vps-log-${{ github.run_id }}
+          path: logs/
+          if-no-files-found: ignore
+          retention-days: 14

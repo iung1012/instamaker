@@ -1,0 +1,12 @@
+playwright
+yt-dlp
+Pillow
+edge-tts
+gTTS
+faster-whisper
+deep-translator
+twikit
+static-ffmpeg
+google-api-python-client
+google-auth-oauthlib
+google-auth-httplib2

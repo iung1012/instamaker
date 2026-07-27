@@ -1,0 +1,103 @@
+name: Setup VPS Cron
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  setup:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      IG_USER_ID: ${{ secrets.IG_USER_ID }}
+      IG_ACCESS_TOKEN: ${{ secrets.IG_ACCESS_TOKEN }}
+      TWITTER_COOKIES_JSON: ${{ secrets.TWITTER_COOKIES_JSON }}
+      VPS_HOST: ${{ secrets.VPS_HOST }}
+      VPS_USER: ${{ secrets.VPS_USER }}
+      VPS_PORT: ${{ secrets.VPS_PORT }}
+      VPS_SSH_KEY: ${{ secrets.VPS_SSH_KEY }}
+      VPS_PATH: ${{ secrets.VPS_PATH }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Configure SSH
+        shell: bash
+        run: |
+          set -euo pipefail
+          install -d -m 700 "$HOME/.ssh"
+          printf '%s\n' "$VPS_SSH_KEY" | tr -d '\r' > "$HOME/.ssh/instagram_vps"
+          chmod 600 "$HOME/.ssh/instagram_vps"
+          ssh-keyscan -p "$VPS_PORT" -H "$VPS_HOST" > "$HOME/.ssh/known_hosts"
+          chmod 600 "$HOME/.ssh/known_hosts"
+          {
+            echo "Host instagram-vps"
+            echo "  HostName $VPS_HOST"
+            echo "  User $VPS_USER"
+            echo "  Port $VPS_PORT"
+            echo "  IdentityFile $HOME/.ssh/instagram_vps"
+            echo "  IdentitiesOnly yes"
+            echo "  BatchMode yes"
+            echo "  StrictHostKeyChecking yes"
+          } > "$HOME/.ssh/config"
+          chmod 600 "$HOME/.ssh/config"
+
+      - name: Install credentials and cron
+        shell: bash
+        run: |
+          set -euo pipefail
+          runtime_dir="$RUNNER_TEMP/cron-runtime"
+          install -d -m 700 "$runtime_dir"
+          printf '%s' "$IG_USER_ID" > "$runtime_dir/IG_USER_ID"
+          printf '%s' "$IG_ACCESS_TOKEN" > "$runtime_dir/IG_ACCESS_TOKEN"
+          printf '%s' "$TWITTER_COOKIES_JSON" > "$runtime_dir/cookies.json"
+          cp run_vps_cron.sh "$runtime_dir/run_vps_cron.sh"
+          chmod 600 "$runtime_dir"/*
+
+          tar -C "$runtime_dir" -czf - . |
+            ssh instagram-vps \
+              "set -e; umask 077; mkdir -p '$VPS_PATH/.cron-setup'; tar -xzf - -C '$VPS_PATH/.cron-setup'"
+
+          ssh instagram-vps bash -s -- "$VPS_PATH" <<'REMOTE'
+          set -euo pipefail
+          project_dir="$1"
+          setup_dir="$project_dir/.cron-setup"
+
+          printf 'IG_USER_ID=%s\n' "$(<"$setup_dir/IG_USER_ID")" > "$project_dir/.env"
+          printf 'IG_ACCESS_TOKEN=%s\n' "$(<"$setup_dir/IG_ACCESS_TOKEN")" >> "$project_dir/.env"
+          cp "$setup_dir/cookies.json" "$project_dir/cookies.json"
+          cp "$setup_dir/run_vps_cron.sh" "$project_dir/run_vps_cron.sh"
+          chmod 600 "$project_dir/.env" "$project_dir/cookies.json"
+          chmod 700 "$project_dir/run_vps_cron.sh"
+          mkdir -p "$project_dir/logs"
+
+          existing="$(crontab -l 2>/dev/null || true)"
+          filtered="$(
+            printf '%s\n' "$existing" |
+              awk '
+                $0 == "# instagram_automation:start" {skip=1; next}
+                $0 == "# instagram_automation:end" {skip=0; next}
+                !skip {print}
+              '
+          )"
+
+          {
+            if [[ -n "$filtered" ]]; then
+              printf '%s\n' "$filtered"
+            fi
+            echo "# instagram_automation:start"
+            echo "# Horarios em America/Sao_Paulo: 09:00, 12:00, 15:00, 18:00 e 21:00"
+            echo "0 12 * * * bash \"$project_dir/run_vps_cron.sh\" >> \"$project_dir/logs/cron.log\" 2>&1"
+            echo "0 15 * * * bash \"$project_dir/run_vps_cron.sh\" >> \"$project_dir/logs/cron.log\" 2>&1"
+            echo "0 18 * * * bash \"$project_dir/run_vps_cron.sh\" >> \"$project_dir/logs/cron.log\" 2>&1"
+            echo "0 21 * * * bash \"$project_dir/run_vps_cron.sh\" >> \"$project_dir/logs/cron.log\" 2>&1"
+            echo "0 0 * * * bash \"$project_dir/run_vps_cron.sh\" >> \"$project_dir/logs/cron.log\" 2>&1"
+            echo "# instagram_automation:end"
+          } | crontab -
+
+          rm -rf "$setup_dir"
+          crontab -l
+          REMOTE

@@ -1,0 +1,59 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Virtual environments
+venv/
+.venv/
+env/
+
+# Environment files / secrets
+.env
+.env.*
+!.env.example
+
+# Cookie jar do X/Twitter usado pelo scraper.
+cookies.json
+
+# OAuth local credentials/tokens
+youtube_token.json
+youtube_client_secret*.json
+client_secret*.json
+
+# Logs
+*.log
+
+# Build / distribution
+build/
+dist/
+*.egg-info/
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+
+# Project outputs
+outputs_ig/
+timeline_downloads/
+
+# Large media artifacts
+*.mp4
+*.mp3
+!avatar_video.mp4
+!nastelbom-minimal-technology-345194.mp3
+
+# Bot do Telegram
+telegram_downloads/
+.telegram_jobs.json
+.character_state.json
+
+# Biblioteca de personagens (versionada, apesar da regra geral de *.mp4)
+!characters/
+!characters/**
+.automation_state.json

@@ -1,5 +1,7 @@
 # Instagram Automation
 
+<!-- Auto-Deploy Status: Active -->
+
 Automacao para capturar videos do X/Twitter, montar videos verticais e publicar no Instagram como Reels/Stories e, opcionalmente, no YouTube como Shorts.
 
 ## O que faz

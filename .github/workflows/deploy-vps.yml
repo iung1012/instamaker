@@ -1,0 +1,30 @@
+name: Auto Deploy to VPS
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+jobs:
+  deploy:
+    name: Deploy to VPS
+    runs-on: ubuntu-latest
+    steps:
+      - name: Executar atualização na VPS via SSH
+        uses: appleboy/ssh-action@v1.2.0
+        with:
+          host: ${{ secrets.VPS_HOST }}
+          username: ${{ secrets.VPS_USER }}
+          password: ${{ secrets.VPS_PASSWORD }}
+          script: |
+            set -e
+            echo "--- Atualizando código em /opt/instagram-bot ---"
+            cd /opt/instagram-bot
+            git fetch origin main
+            git reset --hard origin/main
+            echo "--- Atualizando dependências ---"
+            ./venv/bin/pip install -r requirements.txt
+            echo "--- Reiniciando serviço do Telegram Bot ---"
+            systemctl restart instagram-bot.service
+            echo "--- Deploy concluído com sucesso! ---"

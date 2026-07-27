@@ -158,7 +158,7 @@ def do_publish(session_path: Path, video: Path, caption: str,
             upload_video = remove_audio(video)
             media = client.clip_upload_with_music(
                 upload_video, caption, track, thumbnail=thumbnail,
-                original_volume=0.0, music_volume=1.0,
+                original_volume=1.0, music_volume=1.0,
             )
             print(f"Musica: {track.get('title')} - {track.get('display_artist')}")
         else:

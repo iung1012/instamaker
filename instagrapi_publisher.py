@@ -156,6 +156,22 @@ def do_publish(session_path: Path, video: Path, caption: str,
             leftover.unlink(missing_ok=True)
 
     print(f"Post ID: {media.pk} | https://www.instagram.com/reel/{media.code}/")
+    
+    # Salvar no historico para analytics
+    import time, json
+    history_file = Path("history.json")
+    try:
+        history = json.loads(history_file.read_text()) if history_file.is_file() else []
+    except Exception:
+        history = []
+    history.append({
+        "pk": media.pk,
+        "code": media.code,
+        "timestamp": time.time()
+    })
+    # Manter só os últimos 50
+    history_file.write_text(json.dumps(history[-50:], indent=2))
+    
     return 0
 
 

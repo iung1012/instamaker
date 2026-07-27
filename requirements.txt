@@ -4,6 +4,12 @@ Pillow
 edge-tts
 gTTS
 faster-whisper
+playwright
+yt-dlp
+Pillow
+edge-tts
+gTTS
+faster-whisper
 deep-translator
 twikit
 static-ffmpeg
@@ -11,4 +17,5 @@ google-api-python-client
 google-auth-oauthlib
 google-auth-httplib2
 instagrapi
-tiktok-uploader
+tiktok-uploader>=1.2.0
+google-genai>=0.3.0

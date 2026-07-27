@@ -24,6 +24,7 @@ from urllib import error, parse, request
 
 import characters as character_lib
 import nethelp
+import ai_helper
 from caption_generator import generate_caption, generate_hook, load_dotenv
 
 TELEGRAM_API = "https://api.telegram.org"
@@ -533,8 +534,8 @@ def caption_keyboard(job_id: str) -> dict:
     ]]}
 
 
-def hook_keyboard(draft_id: str) -> dict:
-    return {"inline_keyboard": [
+def hook_keyboard(draft_id: str, has_ai: bool = False) -> dict:
+    rows = [
         [
             {"text": "✅ Usar este", "callback_data": f"hok:{draft_id}"},
             {"text": "🔄 Refazer", "callback_data": f"rhk:{draft_id}"},
@@ -543,7 +544,10 @@ def hook_keyboard(draft_id: str) -> dict:
             {"text": "✏️ Escrever o meu", "callback_data": f"whk:{draft_id}"},
             {"text": "🗑 Cancelar", "callback_data": f"dhk:{draft_id}"},
         ],
-    ]}
+    ]
+    if has_ai:
+        rows.insert(0, [{"text": "🤖 Sugerir Ganchos IA", "callback_data": f"aih:{draft_id}"}])
+    return {"inline_keyboard": rows}
 
 
 def menu_keyboard(is_admin: bool) -> dict:
@@ -765,7 +769,7 @@ class Bot:
             "hook": hook,
             "created": time.time(),
         }
-        self.say(chat_id, self.hook_preview(hook), hook_keyboard(draft_id))
+        self.say(chat_id, self.hook_preview(hook), hook_keyboard(draft_id, ai_helper.is_ai_available()))
 
     def hook_preview(self, hook: str) -> str:
         if not hook:
@@ -809,7 +813,10 @@ class Bot:
             return
 
         progress.stage(1)
-        caption, origin = build_caption_for(context_text, self.hashtags_max)
+        if draft.get("ai_caption") and draft.get("ai_approved"):
+            caption, origin = draft["ai_caption"], "IA Gemini"
+        else:
+            caption, origin = build_caption_for(context_text, self.hashtags_max)
 
         job_id = uuid.uuid4().hex[:10]
         self.jobs[job_id] = {
@@ -1162,32 +1169,57 @@ class Bot:
             return
 
         # -- aprovacao do hook, antes de existir job --------------------
-        if action in {"hok", "rhk", "whk", "dhk"}:
-            draft = self.drafts.get(job_id)
+        if action in {"hok", "rhk", "whk", "dhk", "aih", "aio"}:
+            actual_job_id = job_id.split(":")[0] if ":" in job_id else job_id
+            draft = self.drafts.get(actual_job_id)
             if not draft:
                 answer_callback(self.token, cb_id, "Esse rascunho expirou.")
                 return
             if action == "hok":
                 answer_callback(self.token, cb_id, "Montando...")
-                self.enqueue(("render", chat_id, job_id))
+                self.enqueue(("render", chat_id, actual_job_id))
+            elif action == "aih":
+                answer_callback(self.token, cb_id, "Pensando...")
+                self.say(chat_id, "🤖 Analisando o vídeo e gerando ganchos com IA...")
+                def _run_ai():
+                    try:
+                        res = ai_helper.generate_hooks_and_caption(draft.get("context", ""))
+                        draft["ai_hooks"] = res.get("opcoes_gancho", [])
+                        draft["ai_caption"] = res.get("legenda", "")
+                        rows = []
+                        for idx, opt in enumerate(draft["ai_hooks"]):
+                            rows.append([{"text": f"✅ {opt}", "callback_data": f"aio:{actual_job_id}:{idx}"}])
+                        rows.append([{"text": "🔄 Gerar outros", "callback_data": f"aih:{actual_job_id}"}])
+                        rows.append([{"text": "❌ Cancelar IA", "callback_data": f"rhk:{actual_job_id}"}])
+                        self.say(chat_id, "🤖 Escolha um gancho (a legenda já será gerada):", {"inline_keyboard": rows})
+                    except Exception as e:
+                        self.say(chat_id, f"⚠️ Falha na IA: {e}", hook_keyboard(actual_job_id, ai_helper.is_ai_available()))
+                threading.Thread(target=_run_ai, daemon=True).start()
+            elif action == "aio":
+                answer_callback(self.token, cb_id, "Montando...")
+                idx = int(job_id.split(":")[1])
+                draft["hook"] = draft["ai_hooks"][idx]
+                draft["ai_approved"] = True
+                self.say(chat_id, self.hook_preview(draft["hook"]))
+                self.enqueue(("render", chat_id, actual_job_id))
             elif action == "rhk":
                 answer_callback(self.token, cb_id, "Gerando outro...")
                 novo = self.make_hook(draft.get("context", ""))
                 if novo and novo != draft.get("hook"):
                     draft["hook"] = novo
-                    self.say(chat_id, self.hook_preview(novo), hook_keyboard(job_id))
+                    self.say(chat_id, self.hook_preview(novo), hook_keyboard(actual_job_id, ai_helper.is_ai_available()))
                 else:
                     self.say(chat_id, "Saiu igual ao anterior. Escreva o seu com "
                                       "'✏️ Escrever o meu' se quiser outro.",
-                             hook_keyboard(job_id))
+                             hook_keyboard(actual_job_id, ai_helper.is_ai_available()))
             elif action == "whk":
                 answer_callback(self.token, cb_id, "Manda o texto")
-                self.pending_text[chat_id] = ("hook", job_id)
+                self.pending_text[chat_id] = ("hook", actual_job_id)
                 self.say(chat_id, "✏️ Escreve o gancho (curto, ate ~45 caracteres).")
             else:
                 answer_callback(self.token, cb_id, "Cancelado.")
                 Path(draft["source_video"]).unlink(missing_ok=True)
-                self.drafts.pop(job_id, None)
+                self.drafts.pop(actual_job_id, None)
                 self.say(chat_id, "Cancelado.")
             return
 
@@ -1314,9 +1346,9 @@ class Bot:
 
         # -- comandos so do dono ------------------------------------------
         admin_only = (
-            "/autorizar", "/remover", "/usuarios", "/login", "/cookies", "/tiktok_cookies",
+            "/autorizar", "/remover", "/usuarios", "/login", "/cookies", "/tiktok_cookies", "/conta",
             "/logout", "/novopersonagem", "/addpersonagem", "/personagem ",
-            "/musica", "/musicas",
+            "/musica", "/musicas", "/relatorio"
         )
         if text.startswith(admin_only) or text.strip() == "/personagem":
             if not self.is_admin(user_id):
@@ -1347,6 +1379,23 @@ class Bot:
                 return
             estado = "ligada" if self.use_saved_music else "desligada"
             self.say(chat_id, f"🎵 Musica no Reel: {estado}.")
+            return
+        if text.startswith("/relatorio"):
+            self.say(chat_id, "📊 Buscando estatísticas dos últimos 48h...")
+            def _fetch_stats():
+                try:
+                    result = subprocess.run(
+                        [self.python_bin, "analytics_tracker.py"],
+                        capture_output=True, text=True, cwd=str(self.project_dir), timeout=60
+                    )
+                    out = (result.stdout or result.stderr or "").strip()
+                    if result.returncode != 0 or not out:
+                        self.say(chat_id, "⚠️ Falha ao buscar relatório.")
+                    else:
+                        self.say(chat_id, out)
+                except Exception as e:
+                    self.say(chat_id, f"⚠️ Erro no relatório: {e}")
+            threading.Thread(target=_fetch_stats, daemon=True).start()
             return
         if text.startswith("/autorizar"):
             wanted = text.partition(" ")[2].strip()

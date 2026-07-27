@@ -593,6 +593,8 @@ class Bot:
         self._session_warned = False
         # chats que pediram /cookies e vao mandar o arquivo/texto em seguida
         self.pending_cookies: set[int] = set()
+        # chats que pediram /tiktok_cookies e vao mandar o arquivo/texto em seguida
+        self.pending_tiktok_cookies: set[int] = set()
 
     # -- helpers ----------------------------------------------------------
     def say(self, chat_id: int, text: str, markup: dict | None = None) -> None:
@@ -614,7 +616,9 @@ class Bot:
     def welcome_text(self, user_id: int | None) -> str:
         character = character_lib.pick_character(self.project_dir)
         atual = character_lib.character_label(character) if character else "nenhum"
-        conta = "conectada" if (self.project_dir / IG_SESSION_FILENAME).is_file() else "nao conectada"
+        conta_ig = "conectada" if (self.project_dir / IG_SESSION_FILENAME).is_file() else "nao conectada"
+        tt_cookies_name = os.getenv("TIKTOK_COOKIES_FILE", "tiktok_cookies.txt")
+        conta_tt = "conectada (cookies)" if (self.project_dir / tt_cookies_name).is_file() or (self.project_dir / "cookies.txt").is_file() or (self.project_dir / "cookies.json").is_file() else "nao conectada"
         linhas = [
             "🎬 *Reel Maker*",
             "",
@@ -624,7 +628,8 @@ class Bot:
             f"🎭 Personagem: {atual}",
         ]
         if self.is_admin(user_id):
-            linhas.append(f"📷 Instagram: {conta}")
+            linhas.append(f"📷 Instagram: {conta_ig}")
+            linhas.append(f"🎵 TikTok: {conta_tt}")
         linhas += ["", "Use os botoes abaixo ou /ajuda para ver tudo."]
         return "\n".join(linhas).replace("*", "")
 
@@ -636,7 +641,7 @@ class Bot:
             "2. Eu mostro o gancho da faixa preta: aprova, refaz ou escreve o seu.",
             "3. So depois eu monto o Reel — assim nao gasto render em texto ruim.",
             "4. No Reel pronto da para trocar o personagem, mexer na legenda",
-            "   e publicar.",
+            "   e publicar (no Instagram, TikTok ou Ambos).",
             "",
             "/fila — o que esta em andamento",
             "",
@@ -660,6 +665,9 @@ class Bot:
                 "/login <usuario> <senha> — conecta a conta (a mensagem e apagada)",
                 "/cookies — conecta pelos cookies do navegador (JSON com o sessionid)",
                 "/logout — desconecta",
+                "",
+                "🎵 TikTok",
+                "/tiktok_cookies — envia os cookies do TikTok (tiktok_cookies.txt ou JSON)",
                 "",
                 "🎵 Musica",
                 "/musicas — lista os audios salvos na sua conta",
@@ -1012,6 +1020,16 @@ class Bot:
         who = lines[-1] if lines else "Logado."
         progress.done(f"{who} — o botao Publicar agora posta direto pela sua conta.")
 
+    def save_tiktok_cookies(self, chat_id: int, payload: str) -> None:
+        tt_file_name = os.getenv("TIKTOK_COOKIES_FILE", "tiktok_cookies.txt")
+        tt_file = self.project_dir / tt_file_name
+        tt_file.write_text(payload.strip(), encoding="utf-8")
+        self.say(
+            chat_id,
+            f"🎵 Cookies do TikTok salvos em '{tt_file_name}'!\n"
+            "O botao 🎵 TikTok ou 🚀 Ambos no chat ja pode ser utilizado para publicacao.",
+        )
+
     def publish_instagram(self, chat_id: int, job: dict) -> bool:
         video = Path(job["video"])
         if not video.is_file():
@@ -1296,7 +1314,7 @@ class Bot:
 
         # -- comandos so do dono ------------------------------------------
         admin_only = (
-            "/autorizar", "/remover", "/usuarios", "/login", "/cookies",
+            "/autorizar", "/remover", "/usuarios", "/login", "/cookies", "/tiktok_cookies",
             "/logout", "/novopersonagem", "/addpersonagem", "/personagem ",
             "/musica", "/musicas",
         )
@@ -1398,6 +1416,24 @@ class Bot:
             self.pending_cookies.discard(chat_id)
             self._delete_message(chat_id, message.get("message_id"))
             self.instagram_login_cookies(chat_id, text)
+            return
+        if text.startswith("/tiktok_cookies"):
+            self._delete_message(chat_id, message.get("message_id"))
+            payload = text.partition(" ")[2].strip()
+            if payload:
+                self.save_tiktok_cookies(chat_id, payload)
+            else:
+                self.pending_tiktok_cookies.add(chat_id)
+                self.say(
+                    chat_id,
+                    "Manda agora os cookies do TikTok — como arquivo (.txt / .json) ou em texto.\n"
+                    "Eles serao salvos em 'tiktok_cookies.txt' para habilitar a publicacao direta no TikTok.",
+                )
+            return
+        if chat_id in self.pending_tiktok_cookies and text:
+            self.pending_tiktok_cookies.discard(chat_id)
+            self._delete_message(chat_id, message.get("message_id"))
+            self.save_tiktok_cookies(chat_id, text)
             return
         if text.startswith("/personagens"):
             self.say(chat_id, character_lib.describe_library(self.project_dir))

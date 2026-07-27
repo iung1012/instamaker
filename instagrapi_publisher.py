@@ -59,6 +59,41 @@ def do_login(session_path: Path) -> int:
     return 0
 
 
+def do_login_cookies(session_path: Path) -> int:
+    """Loga com o cookie `sessionid` (JSON {nome: valor} no stdin), sem senha."""
+    import json
+
+    try:
+        data = json.loads(sys.stdin.read())
+    except json.JSONDecodeError:
+        print("Esperava um JSON {nome: valor} no stdin.", file=sys.stderr)
+        return 1
+    if isinstance(data, list):
+        # formato exportado por extensoes de navegador: [{name, value}, ...]
+        cookies = {
+            str(c.get("name")): str(c.get("value"))
+            for c in data
+            if isinstance(c, dict) and c.get("name")
+        }
+    elif isinstance(data, dict):
+        cookies = data
+    else:
+        print("Esperava um JSON {nome: valor} ou uma lista de cookies.", file=sys.stderr)
+        return 1
+    sessionid = str(cookies.get("sessionid") or "").strip()
+    if not sessionid:
+        print("Cookie 'sessionid' nao encontrado.", file=sys.stderr)
+        return 1
+
+    client = build_client(session_path)
+    client.login_by_sessionid(sessionid)
+    client.dump_settings(session_path)
+    session_path.chmod(0o600)
+    info = client.account_info()
+    print(f"Logado como @{info.username}")
+    return 0
+
+
 def do_whoami(session_path: Path) -> int:
     if not session_path.is_file():
         print("Nenhuma sessao salva.", file=sys.stderr)
@@ -93,6 +128,8 @@ def main() -> int:
     parser.add_argument("--session", default=SESSION_FILENAME, help="Arquivo da sessao.")
     action = parser.add_mutually_exclusive_group(required=True)
     action.add_argument("--login", action="store_true", help="Loga com usuario/senha do stdin.")
+    action.add_argument("--login-cookies", action="store_true",
+                        help="Loga com cookies (JSON {nome: valor} no stdin).")
     action.add_argument("--publish", metavar="VIDEO", help="Publica o video como Reel.")
     action.add_argument("--whoami", action="store_true", help="Mostra a conta da sessao.")
     parser.add_argument("--caption", default="", help="Legenda do post.")
@@ -102,6 +139,8 @@ def main() -> int:
     try:
         if args.login:
             return do_login(session_path)
+        if args.login_cookies:
+            return do_login_cookies(session_path)
         if args.whoami:
             return do_whoami(session_path)
         video = Path(args.publish)

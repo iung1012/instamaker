@@ -108,13 +108,41 @@ def send_message(token: str, chat_id: int, text: str, reply_markup: dict | None 
     return api_call(token, "sendMessage", payload)
 
 
+def probe_video(video: Path, python_bin: str) -> dict:
+    """Dimensoes e duracao do arquivo, para o Telegram nao ter que adivinhar."""
+    ffprobe = Path(python_bin).parent / "ffprobe"
+    cmd = [
+        str(ffprobe), "-v", "error",
+        "-select_streams", "v:0",
+        "-show_entries", "stream=width,height:format=duration",
+        "-of", "json", str(video),
+    ]
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+        data = json.loads(result.stdout or "{}")
+        stream = (data.get("streams") or [{}])[0]
+        return {
+            "width": int(stream.get("width") or 0),
+            "height": int(stream.get("height") or 0),
+            "duration": int(float((data.get("format") or {}).get("duration") or 0)),
+        }
+    except (OSError, ValueError, json.JSONDecodeError, subprocess.SubprocessError):
+        return {}
+
+
 def send_video(token: str, chat_id: int, video: Path, caption: str,
-               reply_markup: dict | None = None) -> dict:
+               reply_markup: dict | None = None, python_bin: str = sys.executable) -> dict:
     fields = {
         "chat_id": str(chat_id),
         "caption": caption[:TELEGRAM_CAPTION_LIMIT],
         "supports_streaming": "true",
     }
+    # Sem width/height o cliente do Telegram chuta o enquadramento e mostra o
+    # Reel achatado, mesmo com o arquivo em 9:16 correto.
+    info = probe_video(video, python_bin)
+    for key in ("width", "height", "duration"):
+        if info.get(key):
+            fields[key] = str(info[key])
     if reply_markup:
         fields["reply_markup"] = json.dumps(reply_markup)
     return api_upload(token, "sendVideo", fields, "video", video)
@@ -318,6 +346,39 @@ def build_caption_for(context_text: str, hashtags_max: int) -> tuple[str, str]:
     )
 
 
+def parse_cookie_payload(raw: str) -> dict[str, str]:
+    """Aceita cookies em JSON ({nome: valor} ou export de extensao), Netscape
+    ou "nome=valor; nome2=valor2" e devolve sempre {nome: valor}."""
+    raw = (raw or "").strip()
+    if not raw:
+        return {}
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError:
+        data = None
+    if isinstance(data, dict):
+        return {str(k): str(v) for k, v in data.items() if v is not None}
+    if isinstance(data, list):
+        return {
+            str(c["name"]): str(c.get("value", ""))
+            for c in data
+            if isinstance(c, dict) and c.get("name")
+        }
+
+    cookies: dict[str, str] = {}
+    if "\t" in raw:
+        for line in raw.splitlines():
+            parts = line.split("\t")
+            if len(parts) >= 7 and not line.lstrip().startswith("#"):
+                cookies[parts[5].strip()] = parts[6].strip()
+    else:
+        for chunk in re.split(r";\s*|\n", raw):
+            name, sep, value = chunk.partition("=")
+            if sep and name.strip():
+                cookies[name.strip()] = value.strip()
+    return cookies
+
+
 PROGRESS_SLOTS = 12
 
 
@@ -422,6 +483,10 @@ class Bot:
         self.jobs = load_jobs(self.project_dir)
         # chat_id -> nome do personagem aguardando o video chegar
         self.pending_character: dict[int, str] = {}
+        # chats que pediram /cookies e ainda vao mandar o JSON
+        self.pending_cookies: set[int] = set()
+        # chats que pediram /cookies e vao mandar o arquivo/texto em seguida
+        self.pending_cookies: set[int] = set()
 
     # -- helpers ----------------------------------------------------------
     def say(self, chat_id: int, text: str, markup: dict | None = None) -> None:
@@ -496,6 +561,7 @@ class Bot:
                 self.token, chat_id, output,
                 caption=f"Personagem: {label}  |  legenda via {origin}",
                 reply_markup=job_keyboard(job_id, alternatives),
+                python_bin=self.python_bin,
             )
         except RuntimeError as exc:
             progress.fail(f"Video montado em {output.name}, mas o envio falhou: {exc}")
@@ -573,6 +639,31 @@ class Bot:
         )
 
     # -- publicacao -------------------------------------------------------
+    def _delete_message(self, chat_id: int, message_id: int | None) -> None:
+        if not message_id:
+            return
+        try:
+            api_call(self.token, "deleteMessage",
+                     {"chat_id": chat_id, "message_id": message_id})
+        except RuntimeError:
+            pass
+
+    def instagram_login_cookies(self, chat_id: int, cookies_json: str) -> None:
+        progress = ProgressMessage(self.token, chat_id)
+        progress.stage("Entrando no Instagram com os cookies...", 85)
+        result = subprocess.run(
+            [self.python_bin, "instagrapi_publisher.py", "--login-cookies"],
+            input=cookies_json,
+            capture_output=True, text=True, cwd=str(self.project_dir),
+        )
+        if result.returncode != 0:
+            detail = (result.stderr or result.stdout or "").strip()[-400:]
+            progress.fail(f"Login com cookies falhou.\n{detail}")
+            return
+        lines = (result.stdout or "").strip().splitlines()
+        who = lines[-1] if lines else "Logado."
+        progress.done(f"{who} — o botao Publicar agora posta direto pela sua conta.")
+
     def instagram_login(self, chat_id: int, username: str, password: str) -> None:
         progress = ProgressMessage(self.token, chat_id)
         progress.stage("Entrando no Instagram...", 85)
@@ -697,6 +788,8 @@ class Bot:
                 "deles e sorteado a cada Reel\n"
                 "/login <usuario> <senha> - conecta sua conta do Instagram para "
                 "publicar (a mensagem e apagada do chat)\n"
+                "/cookies - conecta com os cookies do navegador (JSON com o "
+                "sessionid), como texto ou arquivo .json\n"
                 "/logout - desconecta a conta do Instagram\n"
                 "/id - mostra seu id do Telegram",
             )
@@ -714,19 +807,33 @@ class Bot:
             return
         if text.startswith("/login"):
             # A senha nao deve ficar no historico: apaga a mensagem primeiro.
-            message_id = message.get("message_id")
-            if message_id:
-                try:
-                    api_call(self.token, "deleteMessage",
-                             {"chat_id": chat_id, "message_id": message_id})
-                except RuntimeError:
-                    pass
+            self._delete_message(chat_id, message.get("message_id"))
             parts = text.split()
             if len(parts) != 3:
                 self.say(chat_id, "Uso: /login <usuario> <senha>\n"
                                   "A mensagem com a senha e apagada do chat em seguida.")
                 return
             self.instagram_login(chat_id, parts[1], parts[2])
+            return
+        if text.startswith("/cookies"):
+            # sessionid e credencial: a mensagem sai do historico como no /login
+            self._delete_message(chat_id, message.get("message_id"))
+            payload = text.partition(" ")[2].strip()
+            if payload:
+                self.instagram_login_cookies(chat_id, payload)
+            else:
+                self.pending_cookies.add(chat_id)
+                self.say(
+                    chat_id,
+                    "Manda agora o JSON dos cookies — como texto ou arquivo .json.\n"
+                    "Precisa conter o cookie 'sessionid' do instagram.com "
+                    "(DevTools > Application > Cookies, ou uma extensao de exportar cookies).",
+                )
+            return
+        if chat_id in self.pending_cookies and text.startswith(("{", "[")):
+            self.pending_cookies.discard(chat_id)
+            self._delete_message(chat_id, message.get("message_id"))
+            self.instagram_login_cookies(chat_id, text)
             return
         if text.startswith("/personagens"):
             self.say(chat_id, character_lib.describe_library(self.project_dir))
@@ -757,6 +864,22 @@ class Bot:
 
         video = message.get("video") or message.get("document")
         if video and video.get("file_id"):
+            doc_name = (video.get("file_name") or "").lower()
+            if doc_name.endswith(".json") or (
+                chat_id in self.pending_cookies
+                and "json" in (video.get("mime_type") or "")
+            ):
+                self.pending_cookies.discard(chat_id)
+                self._delete_message(chat_id, message.get("message_id"))
+                try:
+                    path = download_telegram_file(self.token, video["file_id"], self.downloads)
+                except RuntimeError as exc:
+                    self.say(chat_id, str(exc))
+                    return
+                payload = path.read_text(encoding="utf-8", errors="ignore")
+                path.unlink(missing_ok=True)
+                self.instagram_login_cookies(chat_id, payload)
+                return
             caption_text = (message.get("caption") or "").strip()
             cap_cmd = re.match(
                 r"/(?:novo|add)personagem\s+(.+)", caption_text, re.IGNORECASE

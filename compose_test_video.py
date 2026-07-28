@@ -26,6 +26,12 @@ TOP_H_MAX = 880
 # personagem fica no topo desse painel, entao o texto desce para o corpo.
 BODY_ANCHOR = 0.42
 
+# Onde comeca o crop vertical do painel do avatar, em fracao da sobra.
+# 0.0 ancora no topo: o que nao cabe sai pelos pes, nunca pela cabeca. Com o
+# crop central de antes, personagem enquadrado com a cabeca alta perdia o topo
+# do rosto -- defeito que nao gera erro no ffmpeg e so aparecia na conta.
+AVATAR_CROP_ANCHOR = 0.0
+
 # Faixa preta entre o video e o avatar, onde mora o hook. A altura acompanha
 # o numero de linhas do hook, dentro destes limites.
 BAND_H_MIN = 130
@@ -283,12 +289,17 @@ def build_avatar_panel(
     panel_w: int,
     panel_h: int,
 ) -> list[str]:
-    """O avatar e asset proprio: pode preencher cortando as bordas."""
+    """O avatar e asset proprio: pode preencher cortando as bordas.
+
+    Horizontal continua centralizado; o vertical ancora em AVATAR_CROP_ANCHOR
+    para preservar o rosto.
+    """
     return [
         (
             f"[{input_label}]fps={OUTPUT_FPS},"
             f"scale={panel_w}:{panel_h}:force_original_aspect_ratio=increase:flags=lanczos,"
-            f"crop={panel_w}:{panel_h}:(iw-{panel_w})/2:(ih-{panel_h})/2,setsar=1[{output_label}]"
+            f"crop={panel_w}:{panel_h}:(iw-{panel_w})/2:(ih-{panel_h})*{AVATAR_CROP_ANCHOR}"
+            f",setsar=1[{output_label}]"
         )
     ]
 

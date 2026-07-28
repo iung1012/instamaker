@@ -2,7 +2,6 @@ import argparse
 import asyncio
 import json
 import os
-import random
 import re
 import shutil
 import subprocess
@@ -61,11 +60,10 @@ SAFE_BOTTOM = 1580
 OUTPUT_FPS = 30
 END_FADE_SECONDS = 0.4
 
-CTA_PHRASES = [
-    "Comente EU QUERO para parte 2",
-    "Salve este video para aplicar depois",
-    "Me siga para mais estrategias praticas",
-]
+# O CTA nao entra mais no video: a chamada para comentar vive na legenda do
+# post, garantida por caption_generator.ensure_comment_cta(). Queimar a mesma
+# chamada no pixel repetia a mensagem e ainda disputava espaco com a UI do
+# Reels no rodape. Continua possivel forcar um com --cta-text.
 
 
 def is_video_file(path: Path) -> bool:
@@ -737,7 +735,10 @@ def build_filter(
         )
         return label_out
 
-    body_enable = f"between(t,{intro_end:.3f},{outro_start:.3f})"
+    # Sem CTA o corpo segue ate o fim: parar em outro_start deixaria o trecho
+    # final sem texto nenhum, que era o espaco que o CTA ocupava.
+    body_end = outro_start if safe_cta else total_duration
+    body_enable = f"between(t,{intro_end:.3f},{body_end:.3f})"
     cta_enable = f"between(t,{outro_start:.3f},{total_duration:.3f})"
 
     # O hook fica o video inteiro: a faixa e um elemento fixo do layout e
@@ -769,25 +770,26 @@ def build_filter(
         start_y=body_y,
         line_step=body_step,
         start_time=intro_end,
-        end_time=outro_start,
+        end_time=body_end,
         fade=text_fade,
     )
 
-    current_label = add_box(current_label, "ctabox", cta_y, len(safe_cta) * cta_step, cta_enable)
-    current_label = append_text_block(
-        filters=filters,
-        input_label=current_label,
-        output_prefix="ctaline",
-        lines=safe_cta,
-        text_dir=text_dir,
-        font_file=safe_font,
-        font_size=cta_size,
-        start_y=cta_y,
-        line_step=cta_step,
-        start_time=outro_start,
-        end_time=total_duration,
-        fade=text_fade,
-    )
+    if safe_cta:
+        current_label = add_box(current_label, "ctabox", cta_y, len(safe_cta) * cta_step, cta_enable)
+        current_label = append_text_block(
+            filters=filters,
+            input_label=current_label,
+            output_prefix="ctaline",
+            lines=safe_cta,
+            text_dir=text_dir,
+            font_file=safe_font,
+            font_size=cta_size,
+            start_y=cta_y,
+            line_step=cta_step,
+            start_time=outro_start,
+            end_time=total_duration,
+            fade=text_fade,
+        )
 
     fade_start = max(0.0, total_duration - END_FADE_SECONDS)
     filters.append(
@@ -875,7 +877,9 @@ def main() -> int:
         "avatar fica limpo e a mensagem fica so na faixa e no CTA.",
     )
     parser.add_argument("--hook-text", help="Texto da faixa. Sem isso, sai do _info.txt do conteudo.")
-    parser.add_argument("--cta-text", help="Texto de encerramento (CTA)")
+    parser.add_argument("--cta-text",
+                        help="Texto de encerramento no video. Vazio por padrao: "
+                             "a chamada para comentar vai na legenda do post.")
     parser.add_argument(
         "--auto-text",
         action="store_true",
@@ -900,7 +904,8 @@ def main() -> int:
     parser.add_argument("--output-dir", default="outputs_ig", help="Diretorio de saida no modo em lote")
     parser.add_argument("--max-duration", type=float, default=40.0, help="Duracao maxima do video final em segundos")
     parser.add_argument("--intro-seconds", type=float, default=1.4, help="Duracao do gancho inicial")
-    parser.add_argument("--outro-seconds", type=float, default=1.8, help="Duracao do CTA final")
+    parser.add_argument("--outro-seconds", type=float, default=1.8,
+                        help="Duracao do CTA final. So tem efeito com --cta-text.")
     parser.add_argument(
         "--top-motion",
         action="store_true",
@@ -1035,9 +1040,8 @@ def main() -> int:
         print(f"Erro: arquivo de narracao nao encontrado: {voice_file}")
         return 1
 
-    # O bloco central so aparece com --text explicito. A faixa carrega a
-    # mensagem do conteudo e o CTA fecha; uma terceira frase generica no meio
-    # so competia com as duas.
+    # O bloco central so aparece com --text explicito: a faixa ja carrega a
+    # mensagem do conteudo, e uma segunda frase generica so competia com ela.
     selected_text = args.text or ""
 
     def render_one(input_video: Path, out_file: Path, text_value: str, hook_value: str | None, cta_value: str | None) -> int:
@@ -1087,7 +1091,7 @@ def main() -> int:
         body_max_lines = 1 if args.single_line else max(1, args.max_body_lines)
         body_max_chars = 999 if args.single_line else args.max_chars_per_line
 
-        cta_final = cta_value or random.choice(CTA_PHRASES)
+        cta_final = cta_value or ""
 
         has_original_audio = probe["has_audio"]
 
@@ -1246,7 +1250,7 @@ def main() -> int:
             # e a pipeline chegam ao mesmo hook para o mesmo video.
             text_for_video = selected_text
             hook_for_video = args.hook_text
-            cta_for_video = args.cta_text or random.choice(CTA_PHRASES)
+            cta_for_video = args.cta_text or ""
             out_file = out_dir / f"{v.stem}_final.mp4"
             rc = render_one(v, out_file, text_for_video, hook_for_video, cta_for_video)
             if rc == 0:

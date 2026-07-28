@@ -326,6 +326,43 @@ Observacao:
 
 - como o fluxo agora usa `video.publish`, se voce tinha token antigo de `video.upload`, rode o login completo novamente para gerar um token com o scope novo.
 
+## Musica salva do Instagram
+
+A publicacao via `instagrapi_publisher.py --music` sorteia uma faixa da sua aba
+de audios salvos (`music/playlist/bookmarked/`) e a mixa dentro do arquivo com
+ffmpeg antes de subir.
+
+O mux e obrigatorio: o `clip_upload_with_music` do instagrapi so envia o
+metadado de atribuicao ("does not download or mux audio into the local video
+file") e o Instagram nao mixa a faixa do lado dele. Subir o arquivo mudo
+resulta em um Reel silencioso com o nome da musica em cima.
+
+Para conferir o resultado sem publicar:
+
+```powershell
+python .\instagrapi_publisher.py --publish .\outputs_ig\video_final.mp4 --music --dry-run
+```
+
+O comando mostra qual faixa salva foi escolhida, de que trecho, onde ficou o
+arquivo montado e o volume medio dele (`-91 dB` seria mudo). Nada e enviado ao
+Instagram, e o arquivo fica no disco para voce assistir.
+
+## Revisao do render pela IA
+
+`video_qa.py` tira alguns frames do Reel pronto e pergunta ao Gemini se a
+cabeca do personagem ficou cortada pelo crop central do painel e se algum
+texto saiu cortado ou fora da zona segura do Reels.
+
+```powershell
+python .\video_qa.py --video .\outputs_ig\video_final.mp4 --hook "o gancho"
+```
+
+Com `--strict` o comando sai com codigo 2 quando a IA reprova. Falha da API
+nunca reprova: a revisao e opcional e nao pode barrar a publicacao.
+
+No bot do Telegram a revisao roda sozinha depois de cada render e so escreve no
+chat quando encontra defeito. Desligue com `AI_REVIEW_RENDERS=0` no `.env`.
+
 ## Pastas geradas
 
 - `timeline_downloads`: videos baixados do X/Twitter.

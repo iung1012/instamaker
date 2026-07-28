@@ -576,6 +576,11 @@ class Bot:
         self.use_saved_music = os.getenv("IG_USE_SAVED_MUSIC", "1").strip() not in {
             "0", "false", "no", "nao"
         }
+        # Revisao visual do render (cabeca cortada / texto cortado) antes do
+        # Publicar. Custa uma chamada ao Gemini por Reel.
+        self.review_renders = os.getenv("AI_REVIEW_RENDERS", "1").strip() not in {
+            "0", "false", "no", "nao"
+        }
         self.python_bin = python_bin
         self.hashtags_max = hashtags_max
         self.downloads = self.project_dir / DOWNLOAD_DIRNAME
@@ -852,6 +857,30 @@ class Bot:
 
         progress.done("Reel pronto 👆")
         self.show_caption(chat_id, job_id, caption)
+        self.review_render(chat_id, output, draft.get("hook", ""), caption)
+
+    def review_render(self, chat_id: int, video: Path, hook: str, caption: str) -> None:
+        """Pede a revisao visual do Reel e avisa no chat antes do Publicar.
+
+        Fora da thread do worker: a chamada leva alguns segundos e a fila nao
+        pode parar por causa de uma conferencia opcional.
+        """
+        if not self.review_renders:
+            return
+
+        def _review() -> None:
+            try:
+                import video_qa
+
+                result = video_qa.review_video(video, hook=hook, caption=caption)
+            except Exception as exc:  # revisao nunca bloqueia a publicacao
+                print(f"Revisao da IA indisponivel: {exc}", file=sys.stderr)
+                return
+            if result.get("aprovado"):
+                return  # so avisa quando ha algo errado
+            self.say(chat_id, video_qa.format_report(result))
+
+        threading.Thread(target=_review, daemon=True).start()
 
     def show_caption(self, chat_id: int, job_id: str, caption: str) -> None:
         self.say(chat_id, f"📝 Legenda do post:\n\n{caption}", caption_keyboard(job_id))

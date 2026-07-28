@@ -347,6 +347,27 @@ O comando mostra qual faixa salva foi escolhida, de que trecho, onde ficou o
 arquivo montado e o volume medio dele (`-91 dB` seria mudo). Nada e enviado ao
 Instagram, e o arquivo fica no disco para voce assistir.
 
+## Agendamento no bot
+
+No Reel pronto, o botao `📅 Agendar` oferece horarios em **horario de Brasilia**:
+dois atalhos relativos (daqui 1h / 3h) e os horarios fixos que a pipeline ja
+usa no cron (09, 12, 15, 18, 21). Na hora marcada o bot publica sozinho no
+Instagram e no TikTok.
+
+- `/agendados` lista o que esta marcado, em ordem.
+- Cada agendamento tem botao para cancelar ou publicar na hora.
+- Publicar manualmente cancela o agendamento pendente.
+- Agendar exige a mesma permissao de publicar.
+
+O agendamento e local, nao usa o `scheduled_publish_time` da Graph API: o bot
+publica por `instagrapi` quando ha sessao salva, e a Graph API nao cobriria
+TikTok nem Stories. Uma thread varre os jobs vencidos a cada 30 segundos e
+reusa o mesmo caminho de publicacao do botao.
+
+Os horarios nascem em `America/Sao_Paulo` (`schedule_slots.py`). A VPS roda em
+UTC: calcular com o relogio local publicaria tres horas fora do escolhido.
+Como o agendamento vive no bot, a maquina precisa estar de pe na hora marcada.
+
 ## Revisao do render pela IA
 
 `video_qa.py` tira alguns frames do Reel pronto e pergunta ao Gemini se a

@@ -20,12 +20,15 @@ from pathlib import Path
 SESSION_FILENAME = ".ig_session.json"
 
 
+def ffmpeg_bin() -> Path:
+    return Path(sys.executable).parent / "ffmpeg"
+
+
 def make_thumbnail(video: Path) -> Path:
     """Frame do video para capa; sem ela o instagrapi exigiria moviepy."""
     dest = video.with_suffix(".thumb.jpg")
-    ffmpeg = Path(sys.executable).parent / "ffmpeg"
     result = subprocess.run(
-        [str(ffmpeg), "-y", "-loglevel", "error", "-ss", "0.5", "-i", str(video),
+        [str(ffmpeg_bin()), "-y", "-loglevel", "error", "-ss", "0.5", "-i", str(video),
          "-frames:v", "1", "-q:v", "3", str(dest)],
         capture_output=True, text=True,
     )
@@ -126,20 +129,113 @@ def pick_saved_track(client, wanted: str = "") -> dict | None:
     return random.choice(tracks)
 
 
-def remove_audio(video: Path) -> Path:
-    """Cria uma copia do video sem a faixa de audio."""
-    dest = video.with_suffix(".muted.mp4")
-    ffmpeg = Path(sys.executable).parent / "ffmpeg"
-    # Em vez de remover a trilha inteira (-an), recodificamos com volume 0
-    # para garantir que o Instagram veja que existe áudio no arquivo
+def download_track_audio(client, track: dict, dest_dir: Path) -> Path | None:
+    """Baixa o audio da faixa salva. `pick_saved_track` devolve o dict cru da
+    API, entao a URL sai de track["uri"], nao do modelo Track do instagrapi."""
+    uri = str(track.get("uri") or track.get("progressive_download_url") or "").strip()
+    if not uri:
+        return None
+    try:
+        return Path(client.track_download_by_url(uri, "track", dest_dir))
+    except Exception as exc:
+        print(f"Aviso: nao consegui baixar a musica ({exc}).", file=sys.stderr)
+        return None
+
+
+def track_start_seconds(track: dict) -> float:
+    """Trecho da musica que o Instagram destaca (o mesmo que o app usaria)."""
+    times = track.get("highlight_start_times_in_ms") or []
+    try:
+        return int(times[0]) / 1000
+    except (IndexError, TypeError, ValueError):
+        return 0.0
+
+
+def mux_track(video: Path, audio: Path, start_seconds: float) -> Path:
+    """Troca o audio do video pela musica escolhida.
+
+    O `clip_upload_with_music` do instagrapi so manda metadado ("does not
+    download or mux audio into the local video file"), e o Instagram nao mixa
+    a faixa do lado dele: se o arquivo subir mudo, o Reel sai mudo com o nome
+    da musica em cima. Entao o mux tem que acontecer aqui.
+
+    `-stream_loop -1` evita que um video mais longo que a faixa termine em
+    silencio; o `-shortest` corta no fim do video.
+    """
+    dest = video.with_suffix(".music.mp4")
     result = subprocess.run(
-        [str(ffmpeg), "-y", "-loglevel", "error", "-i", str(video),
-         "-c:v", "copy", "-c:a", "aac", "-af", "volume=0", str(dest)],
+        [str(ffmpeg_bin()), "-y", "-loglevel", "error",
+         "-i", str(video),
+         "-stream_loop", "-1", "-ss", f"{max(0.0, start_seconds):.3f}", "-i", str(audio),
+         "-map", "0:v:0", "-map", "1:a:0",
+         "-c:v", "copy", "-c:a", "aac", "-b:a", "128k",
+         "-shortest", str(dest)],
         capture_output=True, text=True,
     )
     if result.returncode != 0 or not dest.is_file():
-        raise RuntimeError(f"Nao consegui mutar o video: {result.stderr.strip()[:200]}")
+        raise RuntimeError(f"Nao consegui juntar a musica ao video: {result.stderr.strip()[:200]}")
     return dest
+
+
+def measure_volume(video: Path) -> str:
+    """Volume medio do arquivo. Silencio digital da -91 dB."""
+    result = subprocess.run(
+        [str(ffmpeg_bin()), "-i", str(video), "-af", "volumedetect", "-f", "null", "-"],
+        capture_output=True, text=True,
+    )
+    for line in result.stderr.splitlines():
+        if "mean_volume:" in line:
+            return line.split("mean_volume:", 1)[1].strip()
+    return "desconhecido"
+
+
+def prepare_upload(client, video: Path, music: bool, music_name: str):
+    """Monta o arquivo que vai subir. Devolve (arquivo, track, inicio, audio_tmp).
+
+    Sem musica utilizavel, devolve o video intacto e track None: o chamador
+    publica pelo caminho normal, com o audio original.
+    """
+    track = pick_saved_track(client, music_name) if music else None
+    if not track:
+        if music:
+            print("Aviso: nenhuma musica salva encontrada; publicando sem.", file=sys.stderr)
+        return video, None, 0.0, None
+
+    start = track_start_seconds(track)
+    track_audio = download_track_audio(client, track, video.parent)
+    if not track_audio:
+        print("Aviso: a faixa salva nao tem audio baixavel; "
+              "usando o audio original.", file=sys.stderr)
+        return video, None, 0.0, None
+
+    # A musica precisa estar dentro do arquivo: o metadado do
+    # clip_upload_with_music so gera a atribuicao, nao o som.
+    return mux_track(video, track_audio, start), track, start, track_audio
+
+
+def do_simulate(session_path: Path, video: Path, music: bool, music_name: str) -> int:
+    """Monta o arquivo exatamente como na publicacao, mas nao sobe nada."""
+    if not session_path.is_file():
+        print("Nenhuma sessao salva. Faca /login primeiro.", file=sys.stderr)
+        return 1
+
+    client = build_client(session_path)
+    upload_video, track, start, track_audio = prepare_upload(client, video, music, music_name)
+    if track_audio:
+        track_audio.unlink(missing_ok=True)
+
+    print("\n--- Simulacao (nada foi publicado) ---")
+    if track:
+        print(f"Musica salva: {track.get('title')} - {track.get('display_artist')}")
+        print(f"Trecho: a partir de {start:.1f}s")
+        print(f"audio_cluster_id: {track.get('audio_cluster_id')}")
+    else:
+        print("Musica: nenhuma (o Reel iria com o audio original)")
+    print(f"Arquivo que seria enviado: {upload_video}")
+    print(f"Volume medio: {measure_volume(upload_video)}  (-91 dB = mudo)")
+    if upload_video != video:
+        print("\nAbra esse arquivo e confira o som antes de publicar de verdade.")
+    return 0
 
 
 def do_publish(session_path: Path, video: Path, caption: str,
@@ -150,25 +246,22 @@ def do_publish(session_path: Path, video: Path, caption: str,
 
     client = build_client(session_path)
     thumbnail = make_thumbnail(video)
-    track = pick_saved_track(client, music_name) if music else None
-    upload_video = video
+    upload_video, track, start, track_audio = prepare_upload(client, video, music, music_name)
     try:
         if track:
-            # O Instagram as vezes ignora original_volume=0.0, entao removemos o audio via ffmpeg
-            upload_video = remove_audio(video)
             media = client.clip_upload_with_music(
                 upload_video, caption, track, thumbnail=thumbnail,
-                original_volume=1.0, music_volume=1.0,
+                audio_asset_start_time=int(start * 1000),
+                original_volume=0.0, music_volume=1.0,
             )
             print(f"Musica: {track.get('title')} - {track.get('display_artist')}")
         else:
-            if music:
-                print("Aviso: nenhuma musica salva encontrada; publicando sem.",
-                      file=sys.stderr)
             media = client.clip_upload(video, caption, thumbnail=thumbnail)
     finally:
         if upload_video != video:
             upload_video.unlink(missing_ok=True)
+        if track_audio:
+            track_audio.unlink(missing_ok=True)
         thumbnail.unlink(missing_ok=True)
         # o instagrapi costuma deixar um .jpg proprio ao lado do video
         for leftover in video.parent.glob(f"{video.stem}.thumb.jpg.*"):
@@ -209,6 +302,9 @@ def main() -> int:
                         help="Usa uma das musicas salvas no Instagram.")
     parser.add_argument("--music-name", default="",
                         help="Escolhe a musica salva pelo titulo/artista.")
+    parser.add_argument("--dry-run", action="store_true",
+                        help="Monta o video com a musica e mostra o resultado, "
+                             "sem publicar. Use com --publish.")
     args = parser.parse_args()
 
     session_path = Path(args.session)
@@ -236,6 +332,8 @@ def main() -> int:
         if not video.is_file():
             print(f"Video nao encontrado: {video}", file=sys.stderr)
             return 1
+        if args.dry_run:
+            return do_simulate(session_path, video, args.music, args.music_name)
         return do_publish(session_path, video, args.caption,
                           music=args.music, music_name=args.music_name)
     except Exception as exc:  # erros do instagrapi viram mensagem legivel no chat

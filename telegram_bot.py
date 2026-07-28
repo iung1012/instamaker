@@ -38,6 +38,23 @@ IG_SESSION_FILENAME = ".ig_session.json"
 GUESTS_FILENAME = ".allowed_users.json"
 URL_RE = re.compile(r"https?://\S+")
 
+# O GraphQL do x.com as vezes demora mais que os 20s padrao do yt-dlp, e um
+# unico timeout matava o trabalho inteiro. Sao segundos de espera, nao um
+# problema de cookies -- o mesmo link costuma funcionar na tentativa seguinte.
+YTDLP_NET_ARGS = [
+    "--socket-timeout", os.getenv("YTDLP_SOCKET_TIMEOUT", "60"),
+    "--retries", os.getenv("YTDLP_RETRIES", "5"),
+    "--extractor-retries", os.getenv("YTDLP_RETRIES", "5"),
+    "--retry-sleep", "linear=1::3",
+]
+
+# Erros que realmente apontam para cookies/autenticacao. Fora desta lista, a
+# dica sobre cookies.json so confunde: o caso comum e rede instavel.
+AUTH_ERROR_HINTS = (
+    "nsfw", "age-restricted", "log in", "login", "logged in", "private",
+    "protected", "not authorized", "unauthorized", "401", "403",
+)
+
 # Faxina: arquivos de trabalho velhos somem sozinhos. O disco e compartilhado
 # com a Evolution API e os renders sao grandes.
 CLEANUP_AFTER_DAYS = int(os.getenv("CLEANUP_AFTER_DAYS", "7"))
@@ -233,6 +250,7 @@ def download_from_url(url: str, dest_dir: Path, project_dir: Path, python_bin: s
         python_bin, "-m", "yt_dlp",
         "--no-playlist",
         "--quiet", "--no-warnings",
+        *YTDLP_NET_ARGS,
         "-f", "bestvideo+bestaudio/best",
         "-o", template,
     ]
@@ -259,9 +277,24 @@ def download_from_url(url: str, dest_dir: Path, project_dir: Path, python_bin: s
     return max(produced, key=lambda p: p.stat().st_size)
 
 
+def download_failure_hint(error_text: str) -> str:
+    """Dica coerente com o erro real.
+
+    Sugerir cookies.json para um read timeout mandava o dono procurar defeito
+    onde nao havia: o mesmo link costuma funcionar na tentativa seguinte.
+    """
+    lowered = error_text.lower()
+    if any(marker in lowered for marker in AUTH_ERROR_HINTS):
+        return "Parece post privado ou restrito: confira o cookies.json (/cookies)."
+    if "timed out" in lowered or "timeout" in lowered or "connection" in lowered:
+        return "Deu tempo esgotado falando com o site. Manda o link de novo."
+    return "Manda o link de novo. Se insistir, confira o cookies.json (/cookies)."
+
+
 def fetch_url_description(url: str, project_dir: Path, python_bin: str) -> str:
     """Pega titulo/descricao do post, que viram contexto do hook e da legenda."""
     cmd = [python_bin, "-m", "yt_dlp", "--skip-download", "--no-warnings",
+           *YTDLP_NET_ARGS,
            "--print", "%(description)s|||%(title)s", url]
     cookies_json = project_dir / os.getenv("TWITTER_COOKIES_FILE", "cookies.json")
     tmp_cookie = None
@@ -733,7 +766,7 @@ class Bot:
         try:
             source = download_from_url(url, self.downloads, self.project_dir, self.python_bin)
         except RuntimeError as exc:
-            progress.fail(f"{exc}\n\nSe for post privado, confira o cookies.json.")
+            progress.fail(f"{exc}\n\n{download_failure_hint(str(exc))}")
             return
         progress.stage(1)
         context = fetch_url_description(url, self.project_dir, self.python_bin)

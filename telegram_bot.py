@@ -25,6 +25,7 @@ from urllib import error, parse, request
 import characters as character_lib
 import nethelp
 import ai_helper
+import schedule_slots
 from caption_generator import generate_caption, generate_hook, load_dotenv
 
 TELEGRAM_API = "https://api.telegram.org"
@@ -63,6 +64,9 @@ CLEANUP_INTERVAL_SECONDS = 3600
 # guardamos o resultado para nao consultar a cada publicacao.
 SESSION_CHECK_INTERVAL = 6 * 3600
 SESSION_CACHE_SECONDS = 1800
+# De quanto em quanto o agendador olha se algum Reel venceu. 30s da precisao
+# de sobra para slots de hora cheia e nao pesa em nada.
+SCHEDULE_TICK_SECONDS = 30
 
 
 # --------------------------------------------------------------------------
@@ -551,6 +555,7 @@ def job_keyboard(job_id: str, has_alternatives: bool) -> dict:
             {"text": "🚀 Ambos", "callback_data": f"p_all:{job_id}"},
         ],
         [
+            {"text": "📅 Agendar", "callback_data": f"sch:{job_id}"},
             {"text": "✏️ Legenda", "callback_data": f"cap:{job_id}"},
             {"text": "🗑 Descartar", "callback_data": f"del:{job_id}"},
         ],
@@ -558,6 +563,24 @@ def job_keyboard(job_id: str, has_alternatives: bool) -> dict:
     if has_alternatives:
         rows.insert(0, [{"text": "🎭 Trocar personagem", "callback_data": f"chg:{job_id}"}])
     return {"inline_keyboard": rows}
+
+
+def schedule_keyboard(job_id: str, now: float | None = None) -> dict:
+    """Slots de agendamento. O epoch vai inteiro no callback, ja resolvido em
+    Brasilia, para o clique nao depender do fuso de quem clica."""
+    rows = [
+        [{"text": f"🕐 {rotulo}", "callback_data": f"sca:{job_id}:{int(epoch)}"}]
+        for rotulo, epoch in schedule_slots.slot_options(now)
+    ]
+    rows.append([{"text": "↩️ Voltar", "callback_data": f"scb:{job_id}"}])
+    return {"inline_keyboard": rows}
+
+
+def scheduled_keyboard(job_id: str) -> dict:
+    return {"inline_keyboard": [[
+        {"text": "🚀 Publicar agora", "callback_data": f"p_all:{job_id}"},
+        {"text": "❌ Cancelar agendamento", "callback_data": f"scx:{job_id}"},
+    ]]}
 
 
 def caption_keyboard(job_id: str) -> dict:
@@ -686,6 +709,7 @@ class Bot:
             "   e publicar (no Instagram, TikTok ou Ambos).",
             "",
             "/fila — o que esta em andamento",
+            "/agendados — Reels com hora marcada",
             "",
             "🎭 Personagens",
             "/personagens — lista a biblioteca",
@@ -1191,6 +1215,70 @@ class Bot:
         if destination in ("tiktok", "tt", "all"):
             self.publish_tiktok(chat_id, job)
 
+    # -- agendamento -------------------------------------------------------
+    def handle_schedule(self, chat_id: int, cb_id: str, action: str,
+                        partes: list[str], job: dict) -> None:
+        job_id = partes[0]
+        if action == "sch":
+            answer_callback(self.token, cb_id)
+            self.say(chat_id, "📅 Publicar quando? (horario de Brasilia)",
+                     schedule_keyboard(job_id))
+            return
+
+        if action == "scb":
+            answer_callback(self.token, cb_id)
+            self.say(chat_id, "Ok, sem agendar.", job_keyboard(job_id, False))
+            return
+
+        if action == "scx":
+            answer_callback(self.token, cb_id, "Agendamento cancelado.")
+            job.pop("scheduled_for", None)
+            save_jobs(self.project_dir, self.jobs)
+            self.say(chat_id, "❌ Agendamento cancelado. O Reel continua aqui.",
+                     job_keyboard(job_id, False))
+            return
+
+        # sca: o epoch vem no proprio callback, ja resolvido em Brasilia.
+        try:
+            quando = float(partes[1])
+        except (IndexError, ValueError):
+            answer_callback(self.token, cb_id, "Horario invalido.")
+            return
+
+        job["scheduled_for"] = quando
+        save_jobs(self.project_dir, self.jobs)
+        answer_callback(self.token, cb_id, "Agendado.")
+        self.say(
+            chat_id,
+            f"📅 Agendado para {schedule_slots.format_when(quando)} "
+            "(Instagram + TikTok).\n"
+            "O bot publica sozinho na hora. /agendados lista tudo.",
+            scheduled_keyboard(job_id),
+        )
+
+    def schedule_loop(self) -> None:
+        """Publica os agendados quando a hora chega.
+
+        Fora da fila de render: um job vencido nao deve esperar um render de
+        40s terminar para ir ao ar.
+        """
+        while True:
+            try:
+                for job_id in schedule_slots.due_job_ids(self.jobs):
+                    job = self.jobs.get(job_id)
+                    if not job:
+                        continue
+                    job.pop("scheduled_for", None)
+                    save_jobs(self.project_dir, self.jobs)
+                    chat_id = job.get("chat_id")
+                    self.say(chat_id, "📅 Chegou a hora do agendamento. Publicando...")
+                    self.publish(chat_id, job, destination="all")
+                    self.jobs.pop(job_id, None)
+                    save_jobs(self.project_dir, self.jobs)
+            except Exception as exc:  # um job ruim nao para o agendador
+                print(f"Erro no agendador: {exc}", file=sys.stderr)
+            time.sleep(SCHEDULE_TICK_SECONDS)
+
     # -- callbacks --------------------------------------------------------
     def handle_menu(self, chat_id: int, user_id: int | None, item: str) -> None:
         admin = self.is_admin(user_id)
@@ -1285,6 +1373,22 @@ class Bot:
                 self.say(chat_id, "Cancelado.")
             return
 
+        # Agendamento: o "sca" carrega o epoch junto do id, entao o parse vem
+        # antes da busca do job.
+        if action in {"sch", "sca", "scb", "scx"}:
+            # Agendar e publicar depois: mesma permissao do Publicar, senao
+            # seria uma porta lateral para quem nao pode postar.
+            if not (self.is_admin(user_id) or self.guests_can_publish):
+                answer_callback(self.token, cb_id, "So o dono publica.")
+                return
+            partes = job_id.split(":")
+            alvo = self.jobs.get(partes[0])
+            if not alvo:
+                answer_callback(self.token, cb_id, "Esse job expirou.")
+                return
+            self.handle_schedule(chat_id, cb_id, action, partes, alvo)
+            return
+
         job = self.jobs.get(job_id)
         if not job:
             answer_callback(self.token, cb_id, "Esse job expirou.")
@@ -1313,6 +1417,7 @@ class Bot:
                 answer_callback(self.token, cb_id, "So o dono publica.")
                 self.say(chat_id, "Voce pode montar Reels, mas a publicacao e do dono do bot.")
                 return
+            job.pop("scheduled_for", None)  # publicar agora cancela o agendamento
             answer_callback(self.token, cb_id, "Publicando...")
             dest = "ig" if action == "p_ig" else ("tt" if action == "p_tt" else "all")
             self.publish(chat_id, job, destination=dest)
@@ -1396,6 +1501,9 @@ class Bot:
             return
         if text.startswith("/id"):
             self.say(chat_id, f"Seu id: {user_id}")
+            return
+        if text.startswith("/agendados"):
+            self.say(chat_id, schedule_slots.scheduled_summary(self.jobs))
             return
         if text.startswith("/fila"):
             pendentes = self.queue.qsize()
@@ -1631,6 +1739,7 @@ class Bot:
             (self.worker_loop, "worker"),
             (self.cleanup_loop, "faxina"),
             (self.session_watch_loop, "sessao"),
+            (self.schedule_loop, "agendador"),
         ):
             threading.Thread(target=target, name=name, daemon=True).start()
 

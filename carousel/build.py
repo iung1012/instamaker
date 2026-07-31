@@ -12,7 +12,7 @@ import re
 from datetime import datetime
 
 MAX = {  # limites que o layout aguenta sem vazar
-    "title": 15,
+    "title": 13,
     "chip": 14,
     "body": 190,
     "item_t": 10,
@@ -90,6 +90,30 @@ empresa lancou, anunciou ou confirmou nada. A capa nao pode afirmar que existe.
     return base
 
 
+def _capitalize(text: str) -> str:
+    """Sobe a primeira letra do paragrafo, pulando tags HTML.
+
+    O modelo entrega "o post acumula 45 mil..." e "segundo o post, ...". Nao da
+    para usar .capitalize(): isso rebaixaria o resto ("VisionPsy" viraria
+    "Visionpsy") e falharia quando o paragrafo comeca com <em> ou <strong>.
+    """
+    index = 0
+    while index < len(text):
+        char = text[index]
+        if char == "<":
+            fim = text.find(">", index)
+            if fim == -1:
+                break
+            index = fim + 1  # salta a tag inteira; so `continue` capitalizava o "<s"
+            continue
+        if char.isalpha():
+            return text[:index] + char.upper() + text[index + 1:]
+        if not char.isspace():
+            break
+        index += 1
+    return text
+
+
 def _clip(value: str, limit: int, word_safe: bool = False) -> str:
     """Corta no limite. Em titulo corta na palavra: '/MAX-TOKENS-CAD' e pior que '/MAX-TOKENS'."""
     value = (value or "").strip()
@@ -117,7 +141,8 @@ def _sanitize(deck: dict) -> dict:
             continue
         slide["title"] = _clip(slide.get("title", ""), MAX["title"], word_safe=True).upper()
         slide["chip"] = _clip(slide.get("chip", ""), MAX["chip"]).upper()
-        slide["body"] = [_clip(b, MAX["body"]) for b in (slide.get("body") or [])[:2]]
+        slide["body"] = [_capitalize(_clip(b, MAX["body"]))
+                         for b in (slide.get("body") or [])[:2]]
         for item in slide.get("items", [])[:4]:
             item["t"] = _clip(item.get("t", ""), MAX["item_t"], word_safe=True).upper()
             item["d"] = _clip(item.get("d", ""), MAX["item_d"])

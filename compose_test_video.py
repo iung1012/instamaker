@@ -872,6 +872,12 @@ def main() -> int:
     parser.add_argument("--video", help="Arquivo de video principal (parte de cima)")
     parser.add_argument("--avatar", required=True, help="Arquivo de avatar (imagem ou video, parte de baixo)")
     parser.add_argument(
+        "--avatar-start",
+        type=float,
+        default=0.0,
+        help="Segundo em que o clipe do avatar comeca (varia o trecho entre posts)",
+    )
+    parser.add_argument(
         "--text",
         help="Texto do bloco central, sobre o avatar. Opcional: sem ele o "
         "avatar fica limpo e a mensagem fica so na faixa e no CTA.",
@@ -1182,6 +1188,11 @@ def main() -> int:
             ffmpeg_bin = resolve_executable("ffmpeg")
             cmd = [ffmpeg_bin, "-y", "-i", str(input_video)]
             if is_video_file(avatar):
+                # -ss antes do -i entra no trecho sorteado: com um personagem so
+                # na biblioteca, e isso que impede o painel de baixo de sair igual
+                # em todo post. O -stream_loop cobre o resto da duracao.
+                if getattr(args, "avatar_start", 0):
+                    cmd += ["-ss", f"{float(args.avatar_start):.2f}"]
                 cmd += ["-stream_loop", "-1", "-i", str(avatar)]
             else:
                 cmd += ["-loop", "1", "-i", str(avatar)]

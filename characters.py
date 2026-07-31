@@ -109,6 +109,54 @@ def _state_path(project_dir: Path) -> Path:
     return Path(project_dir) / STATE_FILENAME
 
 
+RECENT_MEMORY = 3  # quantos usos recentes evitamos repetir
+
+
+def _load_state(project_dir: Path) -> dict:
+    path = _state_path(project_dir)
+    if not path.is_file():
+        return {}
+    try:
+        state = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+    return state if isinstance(state, dict) else {}
+
+
+def _save_state(project_dir: Path, state: dict) -> None:
+    _state_path(project_dir).write_text(
+        json.dumps(state, indent=2, ensure_ascii=False), encoding="utf-8"
+    )
+
+
+def recent_uses(project_dir: Path) -> list[str]:
+    """Nomes dos ultimos arquivos usados, do mais antigo para o mais novo."""
+    raw = _load_state(project_dir).get("recent")
+    return [str(x) for x in raw] if isinstance(raw, list) else []
+
+
+def record_use(project_dir: Path, path: Path | None) -> None:
+    """Anota o arquivo usado para que os proximos renders nao o repitam."""
+    if path is None:
+        return
+    state = _load_state(project_dir)
+    history = [str(x) for x in state.get("recent", []) if isinstance(x, str)]
+    name = Path(path).name
+    history = [item for item in history if item != name]
+    history.append(name)
+    state["recent"] = history[-(RECENT_MEMORY * 2):]  # guarda folga, usa os 3 ultimos
+    _save_state(project_dir, state)
+
+
+def _drop_recent(options: list[Path], project_dir: Path) -> list[Path]:
+    """Tira os ultimos usados -- mas nunca devolve lista vazia."""
+    recent = set(recent_uses(project_dir)[-RECENT_MEMORY:])
+    if not recent:
+        return options
+    fresh = [p for p in options if Path(p).name not in recent]
+    return fresh or options
+
+
 def load_default_character(project_dir: Path) -> Path | None:
     """Personagem fixado pelo usuario, se ainda existir."""
     path = _state_path(project_dir)
@@ -164,6 +212,7 @@ def pick_character(
             remaining = [p for p in available if Path(p) != exclude_entry]
             if remaining:
                 available = remaining
+        available = _drop_recent(available, project_dir)
         entry = chooser.choice(available)
 
     options = variants(entry)
@@ -173,7 +222,39 @@ def pick_character(
         remaining = [p for p in options if Path(p) != exclude]
         if remaining:
             options = remaining
+    options = _drop_recent(options, project_dir)
     return chooser.choice(options)
+
+
+def segment_start(video: Path, clip_seconds: float,
+                  rng: random.Random | None = None) -> float:
+    """Offset aleatorio para comecar o clipe do personagem.
+
+    Com um unico arquivo em characters/ nao ha o que sortear, e o painel de baixo
+    sai identico em todo post. Variar o trecho resolve isso sem depender de acervo:
+    o mesmo mascarado aparece fazendo coisas diferentes.
+    """
+    video = Path(video)
+    if video.suffix.lower() in {".png", ".jpg", ".jpeg"}:
+        return 0.0
+    try:
+        import subprocess
+
+        from compose_test_video import resolve_executable
+
+        out = subprocess.run(
+            [resolve_executable("ffprobe"), "-v", "error", "-show_entries",
+             "format=duration", "-of", "default=noprint_wrappers=1:nokey=1", str(video)],
+            capture_output=True, text=True, timeout=60,
+        )
+        total = float((out.stdout or "0").strip() or 0)
+    except Exception:
+        return 0.0
+
+    folga = total - clip_seconds
+    if folga <= 1.0:
+        return 0.0
+    return round((rng or random).uniform(0, folga), 2)
 
 
 def describe_library(project_dir: Path) -> str:

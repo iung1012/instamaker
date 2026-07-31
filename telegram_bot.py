@@ -281,6 +281,36 @@ def download_from_url(url: str, dest_dir: Path, project_dir: Path, python_bin: s
     return max(produced, key=lambda p: p.stat().st_size)
 
 
+def fetch_post_source(url: str, project_dir: Path, python_bin: str) -> dict:
+    """Texto, autor e metricas do post.
+
+    Para x.com o proprio site devolve 402 sem login, mas o espelho publico
+    fxtwitter entrega tudo em JSON, inclusive as metricas. Fora do X, cai no
+    fetch_url_description que o bot ja usava.
+    """
+    match = re.search(r"(?:twitter|x)\.com/([^/]+)/status/(\d+)", url)
+    if match:
+        user, status_id = match.group(1), match.group(2)
+        try:
+            with request.urlopen(
+                f"https://api.fxtwitter.com/{user}/status/{status_id}", timeout=20
+            ) as response:
+                tweet = (json.loads(response.read().decode("utf-8"))
+                         .get("tweet") or {})
+            if tweet:
+                return {
+                    "text": tweet.get("text") or "",
+                    "author": ((tweet.get("author") or {}).get("screen_name")) or user,
+                    "url": url,
+                    "views": tweet.get("views"),
+                    "likes": tweet.get("likes"),
+                }
+        except Exception:  # noqa: BLE001 - qualquer falha cai no plano B
+            pass
+    return {"text": fetch_url_description(url, project_dir, python_bin),
+            "author": "", "url": url, "views": None, "likes": None}
+
+
 def download_failure_hint(error_text: str) -> str:
     """Dica coerente com o erro real.
 
@@ -382,6 +412,7 @@ def compose_video(
     character: Path,
     output: Path,
     hook_text: str = "",
+    avatar_start: float = 0.0,
 ) -> None:
     cmd = [
         python_bin, "compose_test_video.py",
@@ -390,6 +421,8 @@ def compose_video(
         "--text-box-opacity", "0.0",
         "--output", str(output),
     ]
+    if avatar_start:
+        cmd.extend(["--avatar-start", f"{avatar_start:.2f}"])
     if hook_text:
         cmd.extend(["--hook-text", hook_text])
 
@@ -401,6 +434,48 @@ def compose_video(
         raise RuntimeError("Composicao terminou sem gerar o arquivo final.")
 
 
+def space_caption(text: str) -> str:
+    """Deixa a legenda respiravel no feed.
+
+    Legenda chegando como um paragrafo unico e corrido rende mal no Instagram, que
+    corta em "mais". Aqui garantimos linha em branco entre os blocos e as hashtags
+    isoladas no fim, venha o texto da IA ou do gerador local.
+    """
+    text = (text or "").replace("\r\n", "\n").strip()
+    if not text:
+        return ""
+
+    tags: list[str] = []
+    body_lines: list[str] = []
+    for line in text.split("\n"):
+        stripped = line.strip()
+        # linha so de hashtags vai toda para o rodape
+        if stripped and all(tok.startswith("#") for tok in stripped.split()):
+            tags.extend(stripped.split())
+        else:
+            body_lines.append(stripped)
+
+    body = "\n".join(body_lines).strip()
+    # hashtags soltas no fim de uma frase tambem sao puxadas para o rodape
+    trailing = re.search(r"((?:\s#[\wÀ-ſ]+)+)\s*$", body)
+    if trailing:
+        tags.extend(trailing.group(1).split())
+        body = body[: trailing.start()].rstrip()
+
+    blocks = [b.strip() for b in re.split(r"\n\s*\n", body) if b.strip()]
+    if len(blocks) == 1 and len(blocks[0]) > 180:
+        # veio tudo grudado: quebra por frase, 2 frases por bloco
+        sentences = [s.strip() for s in re.split(r"(?<=[.!?])\s+", blocks[0]) if s.strip()]
+        blocks = [" ".join(sentences[i:i + 2]) for i in range(0, len(sentences), 2)]
+
+    out = "\n\n".join(blocks)
+    seen: set[str] = set()
+    unique = [t for t in tags if not (t.lower() in seen or seen.add(t.lower()))]
+    if unique:
+        out += "\n\n" + " ".join(unique)
+    return out.strip()
+
+
 def build_caption_for(context_text: str, hashtags_max: int) -> tuple[str, str]:
     try:
         from instagram_graph_publisher import build_viral_hashtags, detect_topics
@@ -408,13 +483,14 @@ def build_caption_for(context_text: str, hashtags_max: int) -> tuple[str, str]:
         hashtags = build_viral_hashtags(detect_topics(context_text), hashtags_max)
     except ImportError:
         hashtags = ""
-    return generate_caption(
+    caption, origin = generate_caption(
         context_text=context_text,
         profile_focus=os.getenv(
             "PROFILE_FOCUS", "programacao, tecnologia e IA com exemplos praticos"
         ),
         hashtags=hashtags,
     )
+    return space_caption(caption), origin
 
 
 def parse_cookie_payload(raw: str) -> dict[str, str]:
@@ -565,6 +641,14 @@ def job_keyboard(job_id: str, has_alternatives: bool) -> dict:
     return {"inline_keyboard": rows}
 
 
+def format_keyboard(pick_id: str) -> dict:
+    """Video (Reel com personagem) ou carrossel (9 slides)."""
+    return {"inline_keyboard": [
+        [{"text": "🎬 Vídeo (Reel)", "callback_data": f"fmv:{pick_id}"}],
+        [{"text": "🖼 Carrossel (9 slides)", "callback_data": f"fmc:{pick_id}"}],
+    ]}
+
+
 def schedule_keyboard(job_id: str, now: float | None = None) -> dict:
     """Slots de agendamento. O epoch vai inteiro no callback, ja resolvido em
     Brasilia, para o clique nao depender do fuso de quem clica."""
@@ -650,6 +734,8 @@ class Bot:
         self.pending_text: dict[int, tuple[str, str]] = {}
         # rascunhos aguardando aprovacao do hook, antes de gastar o render
         self.drafts: dict[str, dict] = {}
+        # link recebido esperando o usuario escolher video ou carrossel
+        self.pending_format: dict[str, dict] = {}
         # Uma fila com um worker: o render come CPU e a maquina tem 2 vCPU,
         # entao processar em paralelo so faria os dois demorarem mais.
         self.queue: queue.Queue = queue.Queue()
@@ -782,6 +868,8 @@ class Bot:
         elif kind == "render":
             exclude = Path(task[3]) if len(task) > 3 and task[3] else None
             self.render_draft(chat_id, task[2], exclude=exclude)
+        elif kind == "carousel":
+            self.build_carousel(chat_id, task[2])
 
     # -- fase 1: preparo e hook -------------------------------------------
     def prepare_from_url(self, chat_id: int, url: str) -> None:
@@ -795,6 +883,57 @@ class Bot:
         progress.stage(1)
         context = fetch_url_description(url, self.project_dir, self.python_bin)
         self.offer_hook(chat_id, source, context, progress)
+
+    # -- carrossel ---------------------------------------------------------
+    def build_carousel(self, chat_id: int, url: str) -> None:
+        """Link -> 9 slides 1080x1350 + legenda, tudo entregue aqui no chat."""
+        import shutil as _shutil
+
+        from carousel import attach_images, build_deck, extract_frames, render_deck
+
+        progress = ProgressMessage(self.token, chat_id, "Montando o carrossel",
+                                   ["Lendo o post", "Pegando os frames",
+                                    "Escrevendo os slides", "Renderizando"])
+        work = self.outputs / f"carousel_{uuid.uuid4().hex[:10]}"
+        try:
+            progress.stage(0)
+            source = fetch_post_source(url, self.project_dir, self.python_bin)
+            if not (source.get("text") or "").strip():
+                progress.fail("Nao consegui ler o texto desse post.")
+                return
+
+            progress.stage(1)
+            images: list[str] = []
+            try:
+                video = download_from_url(url, self.downloads, self.project_dir,
+                                          self.python_bin)
+                images = [str(p) for p in extract_frames(video, work / "img", count=4)]
+            except RuntimeError:
+                # post sem video ou download bloqueado: o carrossel funciona so com texto
+                images = []
+
+            progress.stage(2)
+            deck = build_deck(source, status=os.getenv("CAROUSEL_STATUS", "nao_verificado"))
+            if images:
+                attach_images(deck, images)
+
+            progress.stage(3)
+            slides = render_deck(deck, work / "out")
+        except Exception as exc:  # noqa: BLE001 - qualquer falha vira aviso no chat
+            progress.fail(f"Nao consegui montar o carrossel.\n{exc}")
+            _shutil.rmtree(work, ignore_errors=True)
+            return
+
+        progress.done(f"{len(slides)} slides prontos")
+        for slide in slides:
+            api_upload(self.token, "sendPhoto", {"chat_id": chat_id}, "photo", slide)
+
+        caption = space_caption(
+            (deck.get("caption") or "") + "\n\n" + " ".join(deck.get("hashtags") or [])
+        )
+        self.say(chat_id, f"📝 Legenda:\n\n{caption}" if caption else
+                 "Carrossel pronto (sem legenda gerada).")
+        self.say(chat_id, f"🖼 {len(slides)} slides em {work / 'out'}")
 
     def prepare_from_file(self, chat_id: int, file_id: str, caption_text: str) -> None:
         progress = ProgressMessage(self.token, chat_id, "Preparando", PREPARE_STEPS)
@@ -864,11 +1003,18 @@ class Bot:
         output = self.outputs / f"tg_{uuid.uuid4().hex[:12]}_final.mp4"
         self.outputs.mkdir(parents=True, exist_ok=True)
 
+        # Sorteia o trecho do clipe: mesmo com um personagem so na biblioteca, o
+        # painel de baixo deixa de sair identico em todo post.
+        avatar_start = character_lib.segment_start(
+            character, clip_seconds=probe_video(source_video, self.python_bin).get("duration", 0) or 15
+        )
+        character_lib.record_use(self.project_dir, character)
+
         progress.stage(0)
         try:
             compose_video(
                 self.project_dir, self.python_bin, source_video, character, output,
-                hook_text=draft.get("hook", ""),
+                hook_text=draft.get("hook", ""), avatar_start=avatar_start,
             )
         except RuntimeError as exc:
             progress.fail(f"Nao consegui montar o video.\n{exc}")
@@ -1318,6 +1464,22 @@ class Bot:
             self.handle_menu(chat_id, user_id, job_id)
             return
 
+        # -- escolha do formato, antes de baixar qualquer coisa ---------
+        if action in {"fmv", "fmc"}:
+            pick = self.pending_format.pop(job_id, None)
+            if not pick:
+                answer_callback(self.token, cb_id, "Esse link expirou. Manda de novo.")
+                return
+            if action == "fmv":
+                answer_callback(self.token, cb_id, "Montando o Reel...")
+                self.say(chat_id, "🎬 Beleza, vai de vídeo.")
+                self.enqueue(("url", chat_id, pick["url"]))
+            else:
+                answer_callback(self.token, cb_id, "Montando o carrossel...")
+                self.say(chat_id, "🖼 Beleza, vai de carrossel.")
+                self.enqueue(("carousel", chat_id, pick["url"]))
+            return
+
         # -- aprovacao do hook, antes de existir job --------------------
         if action in {"hok", "rhk", "whk", "dhk", "aih", "aio"}:
             actual_job_id = job_id.split(":")[0] if ":" in job_id else job_id
@@ -1718,8 +1880,15 @@ class Bot:
             if len(urls) > 1:
                 self.say(chat_id, f"📥 {len(urls)} links recebidos. "
                                   "Vou montar um de cada vez.")
+            # Antes de baixar qualquer coisa, pergunta o formato: video (Reel com
+            # personagem) ou carrossel (9 slides). O link fica guardado ate a escolha.
             for url in urls:
-                self.enqueue(("url", chat_id, url))
+                pick_id = uuid.uuid4().hex[:10]
+                self.pending_format[pick_id] = {
+                    "chat_id": chat_id, "url": url, "created": time.time(),
+                }
+                self.say(chat_id, f"🔗 {url}\n\nO que eu monto com isso?",
+                         format_keyboard(pick_id))
             return
 
         self.say(chat_id, "Manda um link de video ou o arquivo. /ajuda mostra os comandos.")

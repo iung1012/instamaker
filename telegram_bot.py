@@ -10,6 +10,7 @@ Rode com:  python telegram_bot.py
 import argparse
 import json
 import mimetypes
+from html import escape as html_escape
 import os
 import queue
 import re
@@ -132,6 +133,62 @@ def api_upload(token: str, method: str, fields: dict, file_field: str, file_path
         raise RuntimeError(f"Telegram HTTP {exc.code} em {method}: {raw}") from exc
     except error.URLError as exc:
         raise RuntimeError(f"Telegram indisponivel em {method}: {exc.reason}") from exc
+
+
+def send_album(token: str, chat_id: int, images: list[Path], timeout: int = 300) -> dict:
+    """Manda ate 10 fotos como um album so (sendMediaGroup).
+
+    Antes o carrossel virava 9 mensagens separadas e enterrava o menu la em cima.
+    Como album, o Telegram agrupa tudo numa mensagem navegavel.
+    """
+    images = [Path(p) for p in images][:10]
+    boundary = f"----crvBoundary{uuid.uuid4().hex}"
+    body = bytearray()
+
+    media = [{"type": "photo", "media": f"attach://f{i}"} for i in range(len(images))]
+    for key, value in (("chat_id", chat_id), ("media", json.dumps(media))):
+        body.extend(f"--{boundary}\r\n".encode())
+        body.extend(f'Content-Disposition: form-data; name="{key}"\r\n\r\n'.encode())
+        body.extend(f"{value}\r\n".encode("utf-8"))
+
+    for index, path in enumerate(images):
+        ctype = mimetypes.guess_type(str(path))[0] or "application/octet-stream"
+        body.extend(f"--{boundary}\r\n".encode())
+        body.extend(f'Content-Disposition: form-data; name="f{index}"; '
+                    f'filename="{path.name}"\r\n'.encode())
+        body.extend(f"Content-Type: {ctype}\r\n\r\n".encode())
+        body.extend(path.read_bytes())
+        body.extend(b"\r\n")
+    body.extend(f"--{boundary}--\r\n".encode())
+
+    req = request.Request(
+        url=api_url(token, "sendMediaGroup"), data=bytes(body), method="POST",
+        headers={"Content-Type": f"multipart/form-data; boundary={boundary}"},
+    )
+    try:
+        with request.urlopen(req, timeout=timeout) as resp:
+            return json.loads(resp.read().decode("utf-8"))
+    except error.HTTPError as exc:
+        raw = exc.read().decode("utf-8", errors="ignore")[:400]
+        raise RuntimeError(f"Telegram HTTP {exc.code} em sendMediaGroup: {raw}") from exc
+    except error.URLError as exc:
+        raise RuntimeError(f"Telegram indisponivel: {exc.reason}") from exc
+
+
+def send_rich(token: str, chat_id: int, html: str,
+              reply_markup: dict | None = None) -> dict | None:
+    """sendRichMessage (Bot API 10.1+), com HTML estendido.
+
+    Devolve None se a API nao aceitar -- o chamador cai para send_message. O
+    recurso e novo e nao vale derrubar o fluxo se a instancia nao suportar.
+    """
+    payload = {"chat_id": chat_id, "html": html}
+    if reply_markup:
+        payload["reply_markup"] = reply_markup
+    try:
+        return api_call(token, "sendRichMessage", payload)
+    except RuntimeError:
+        return None
 
 
 def send_message(token: str, chat_id: int, text: str, reply_markup: dict | None = None) -> dict:
@@ -663,14 +720,23 @@ def job_keyboard(job_id: str, has_alternatives: bool) -> dict:
     return {"inline_keyboard": rows}
 
 
-def carousel_keyboard(job_id: str) -> dict:
-    """Mesmas acoes do Reel, menos TikTok: la carrossel de fotos e outro fluxo."""
-    return {"inline_keyboard": [
-        [{"text": "📷 Publicar no Instagram", "callback_data": f"p_ig:{job_id}"}],
-        [{"text": "📅 Agendar", "callback_data": f"sch:{job_id}"},
+def carousel_keyboard(job_id: str, caption: str = "") -> dict:
+    """Mesmas acoes do Reel, menos TikTok: la carrossel de fotos e outro fluxo.
+
+    `style` (success/danger/primary) e `copy_text` sao da Bot API 10.x. Cliente
+    antigo simplesmente ignora os campos, entao nao ha fallback a fazer.
+    """
+    rows = [
+        [{"text": "📷 Publicar no Instagram", "callback_data": f"p_ig:{job_id}",
+          "style": "success"}],
+        [{"text": "📅 Agendar", "callback_data": f"sch:{job_id}", "style": "primary"},
          {"text": "✏️ Legenda", "callback_data": f"cap:{job_id}"}],
-        [{"text": "🗑 Descartar", "callback_data": f"del:{job_id}"}],
-    ]}
+        [{"text": "🗑 Descartar", "callback_data": f"del:{job_id}", "style": "danger"}],
+    ]
+    # copy_text carrega no maximo 256 chars; legenda maior nao cabe e o botao sai.
+    if caption and len(caption) <= 256:
+        rows.insert(1, [{"text": "📋 Copiar legenda", "copy_text": {"text": caption}}])
+    return {"inline_keyboard": rows}
 
 
 def format_keyboard(pick_id: str) -> dict:
@@ -981,8 +1047,12 @@ class Bot:
             return
 
         progress.done(f"{len(slides)} slides prontos")
-        for slide in slides:
-            api_upload(self.token, "sendPhoto", {"chat_id": chat_id}, "photo", slide)
+        try:
+            send_album(self.token, chat_id, slides)
+        except RuntimeError:
+            # album e so apresentacao: se falhar, manda uma a uma como antes
+            for slide in slides:
+                api_upload(self.token, "sendPhoto", {"chat_id": chat_id}, "photo", slide)
 
         caption = space_caption(
             (deck.get("caption") or "") + "\n\n" + " ".join(deck.get("hashtags") or [])
@@ -997,10 +1067,21 @@ class Bot:
             "created": time.time(),
         }
         save_jobs(self.project_dir, self.jobs)
-        self.say(chat_id,
-                 (f"📝 Legenda:\n\n{caption}\n\n" if caption else "")
-                 + f"🖼 {len(slides)} slides prontos. O que fazer?",
-                 carousel_keyboard(job_id))
+
+        teclado = carousel_keyboard(job_id, caption)
+        titulo = deck["slides"][0]["lines"][0]["text"] if deck.get("slides") else "Carrossel"
+        html = (
+            f"<h3>{html_escape(titulo.title())}</h3>"
+            f"<aside>{len(slides)} slides · fonte "
+            f"<cite>@{html_escape(source.get('author') or 'desconhecida')}</cite></aside>"
+            + (f"<hr><blockquote>{html_escape(caption)}</blockquote>" if caption else "")
+        )
+        # Rich Message da a legenda em bloco destacado; se a instancia nao tiver
+        # o metodo, cai para a mensagem de texto de sempre.
+        if send_rich(self.token, chat_id, html, teclado) is None:
+            self.say(chat_id,
+                     (f"📝 Legenda:\n\n{caption}\n\n" if caption else "")
+                     + f"🖼 {len(slides)} slides prontos. O que fazer?", teclado)
 
     def prepare_from_file(self, chat_id: int, file_id: str, caption_text: str) -> None:
         progress = ProgressMessage(self.token, chat_id, "Preparando", PREPARE_STEPS)

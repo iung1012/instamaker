@@ -179,10 +179,14 @@ def send_rich(token: str, chat_id: int, html: str,
               reply_markup: dict | None = None) -> dict | None:
     """sendRichMessage (Bot API 10.1+), com HTML estendido.
 
-    Devolve None se a API nao aceitar -- o chamador cai para send_message. O
-    recurso e novo e nao vale derrubar o fluxo se a instancia nao suportar.
+    O conteudo vai dentro do objeto `rich_message` (InputRichMessage), NAO solto
+    no nivel raiz -- html/markdown/blocks na raiz devolve
+    "Bad Request: rich message must be non-empty", que nao ajuda em nada.
+
+    Devolve None em qualquer erro: apresentacao nao derruba o fluxo, o chamador
+    cai para send_message.
     """
-    payload = {"chat_id": chat_id, "html": html}
+    payload = {"chat_id": chat_id, "rich_message": {"html": html}}
     if reply_markup:
         payload["reply_markup"] = reply_markup
     try:

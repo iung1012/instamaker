@@ -700,10 +700,11 @@ def scheduled_keyboard(job_id: str) -> dict:
 
 
 def caption_keyboard(job_id: str) -> dict:
-    return {"inline_keyboard": [[
-        {"text": "🔄 Refazer", "callback_data": f"rcp:{job_id}"},
-        {"text": "✏️ Escrever a minha", "callback_data": f"wcp:{job_id}"},
-    ]]}
+    rows = [[{"text": "🔄 Refazer", "callback_data": f"rcp:{job_id}"},
+             {"text": "✏️ Escrever a minha", "callback_data": f"wcp:{job_id}"}]]
+    if ai_helper.is_ai_available():
+        rows.insert(0, [{"text": "🤖 Melhorar com IA", "callback_data": f"aic:{job_id}"}])
+    return {"inline_keyboard": rows}
 
 
 def hook_keyboard(draft_id: str, has_ai: bool = False) -> dict:
@@ -1674,6 +1675,28 @@ class Bot:
             save_jobs(self.project_dir, self.jobs)
             self.say(chat_id, f"📝 Legenda nova (via {origin}):\n\n{caption}",
                      caption_keyboard(job_id))
+            return
+        if action == "aic":
+            answer_callback(self.token, cb_id, "Melhorando...")
+            self.say(chat_id, "🤖 Reescrevendo a legenda com IA...")
+
+            def _melhorar():
+                try:
+                    nova = ai_helper.improve_caption(job.get("context", ""),
+                                                     job.get("caption", ""))
+                except Exception as exc:  # noqa: BLE001 - o job segue com a legenda atual
+                    self.say(chat_id, f"⚠️ Falha na IA: {exc}", caption_keyboard(job_id))
+                    return
+                if not nova:
+                    self.say(chat_id, "A IA voltou vazia. Legenda mantida.",
+                             caption_keyboard(job_id))
+                    return
+                job["caption"] = space_caption(nova)
+                save_jobs(self.project_dir, self.jobs)
+                self.say(chat_id, f"📝 Legenda nova (IA):\n\n{job['caption']}",
+                         caption_keyboard(job_id))
+
+            threading.Thread(target=_melhorar, daemon=True).start()
             return
         if action == "wcp":
             answer_callback(self.token, cb_id, "Manda o texto")

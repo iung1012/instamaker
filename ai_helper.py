@@ -19,6 +19,31 @@ def is_ai_available() -> bool:
     return llm_client.is_available()
 
 
+def improve_caption(context_text: str, current: str = "") -> str:
+    """Reescreve so a legenda, com IA, no formato que rende no feed.
+
+    Separado de generate_hooks_and_caption porque quase sempre o gancho ja esta
+    aprovado e refazer tudo trocaria um texto que o usuario aceitou.
+    """
+    prompt = (
+        f"Assunto do post:\n{context_text}\n\n"
+        + (f"Legenda atual (melhore, nao repita igual):\n{current}\n\n" if current else "")
+        + "Escreva UMA legenda de Instagram em portugues do Brasil, seguindo "
+          "EXATAMENTE esta estrutura, com linhas em branco de verdade entre os blocos:\n"
+          "  linha 1: frase de impacto, sozinha, sem hashtag\n"
+          "  (linha em branco)\n"
+          "  2 a 3 frases curtas de explicacao, uma por linha, com dado concreto\n"
+          "  (linha em branco)\n"
+          "  uma pergunta ou chamada curta para o leitor\n"
+          "  (linha em branco)\n"
+          "  8 a 12 hashtags, todas juntas na ultima linha\n\n"
+          "Nada de paragrafo unico e corrido. Nada de 'revolucionario' ou 'game changer'.\n"
+          'Formato de saida: {"legenda": "..."}'
+    )
+    data = llm_client.chat_json(prompt, system=SYSTEM)
+    return str(data.get("legenda") or "").strip()
+
+
 def generate_hooks_and_caption(tweet_text: str) -> dict:
     """
     Gera 3 ganchos virais e 1 legenda para um video.

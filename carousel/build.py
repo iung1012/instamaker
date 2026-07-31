@@ -155,10 +155,14 @@ def _finish(deck: dict, source: dict) -> dict:
 
 
 def attach_images(deck: dict, images: list[str], captions: list[str] | None = None) -> dict:
-    """Distribui os frames do video pelos slides de conteudo, em ordem."""
+    """Distribui os frames do video pelos slides que sobram espaco.
+
+    So slides `text` recebem imagem. Em list/cards/checks a imagem soma com o bloco,
+    estoura os 1350px e o final e cortado -- checklist de 4 itens aparecendo com 1,
+    lista de 4 passos aparecendo com 2. Perder conteudo e pior que ter menos imagem.
+    """
     captions = captions or []
-    targets = [s for s in deck.get("slides", [])
-               if s.get("type") in ("text", "list", "checks", "cards")]
+    targets = [s for s in deck.get("slides", []) if s.get("type") == "text"]
     for slide, image in zip(targets, images):
         slide["image"] = str(image)
         index = images.index(image)

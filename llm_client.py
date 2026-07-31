@@ -25,13 +25,19 @@ class LLMError(RuntimeError):
 
 
 def is_available() -> bool:
-    return bool(os.getenv("LLM_API_KEY") or os.getenv("GEMINI_API_KEY"))
+    # So LLM_API_KEY conta. Aceitar GEMINI_API_KEY aqui fazia o bot oferecer o
+    # botao de IA numa maquina sem LLM_API_KEY configurada, e a chamada quebrava
+    # depois com "Falha na IA" -- exatamente o caso da vps apos a migracao.
+    return bool((os.getenv("LLM_API_KEY") or "").strip())
 
 
 def _config() -> tuple[str, str, str]:
     key = (os.getenv("LLM_API_KEY") or "").strip()
     if not key:
-        raise LLMError("LLM_API_KEY nao encontrada no .env")
+        raise LLMError(
+            "LLM_API_KEY nao encontrada no .env. O projeto migrou do Gemini para uma "
+            "API compativel com OpenAI: preencha LLM_BASE_URL, LLM_API_KEY e LLM_MODEL."
+        )
     base = (os.getenv("LLM_BASE_URL") or DEFAULT_BASE_URL).strip().rstrip("/")
     model = (os.getenv("LLM_MODEL") or DEFAULT_MODEL).strip()
     return key, base, model

@@ -287,6 +287,30 @@ def do_publish(session_path: Path, video: Path, caption: str,
     return 0
 
 
+def do_publish_album(session_path: Path, images: list, caption: str) -> int:
+    """Publica um carrossel (album de fotos) no Instagram.
+
+    O Instagram aceita de 2 a 10 imagens por album. O carrossel tem 9 slides,
+    entao cabe inteiro em um post so.
+    """
+    paths = [Path(x) for x in images]
+    faltando = [x for x in paths if not x.is_file()]
+    if faltando:
+        print(f"Arquivo nao encontrado: {faltando[0]}")
+        return 1
+    if not 2 <= len(paths) <= 10:
+        print(f"Album aceita de 2 a 10 imagens, recebi {len(paths)}")
+        return 1
+
+    client = build_client(session_path)
+    media = client.album_upload([str(x) for x in paths], caption)
+    print(f"Post ID: {getattr(media, 'pk', '')}")
+    code = getattr(media, "code", "")
+    if code:
+        print(f"Link: https://www.instagram.com/p/{code}/")
+    return 0
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="Publica Reels via instagrapi.")
     parser.add_argument("--session", default=SESSION_FILENAME, help="Arquivo da sessao.")
@@ -295,6 +319,8 @@ def main() -> int:
     action.add_argument("--login-cookies", action="store_true",
                         help="Loga com cookies (JSON {nome: valor} no stdin).")
     action.add_argument("--publish", metavar="VIDEO", help="Publica o video como Reel.")
+    action.add_argument("--publish-album", nargs="+", metavar="IMG",
+                        help="Publica um carrossel de imagens.")
     action.add_argument("--whoami", action="store_true", help="Mostra a conta da sessao.")
     action.add_argument("--list-music", action="store_true", help="Lista as musicas salvas.")
     parser.add_argument("--caption", default="", help="Legenda do post.")
@@ -328,6 +354,8 @@ def main() -> int:
                 track = item.get("track") or {}
                 print(f"- {track.get('title')} — {track.get('display_artist')}")
             return 0
+        if args.publish_album:
+            return do_publish_album(session_path, args.publish_album, args.caption)
         video = Path(args.publish)
         if not video.is_file():
             print(f"Video nao encontrado: {video}", file=sys.stderr)

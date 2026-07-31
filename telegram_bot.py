@@ -663,6 +663,16 @@ def job_keyboard(job_id: str, has_alternatives: bool) -> dict:
     return {"inline_keyboard": rows}
 
 
+def carousel_keyboard(job_id: str) -> dict:
+    """Mesmas acoes do Reel, menos TikTok: la carrossel de fotos e outro fluxo."""
+    return {"inline_keyboard": [
+        [{"text": "📷 Publicar no Instagram", "callback_data": f"p_ig:{job_id}"}],
+        [{"text": "📅 Agendar", "callback_data": f"sch:{job_id}"},
+         {"text": "✏️ Legenda", "callback_data": f"cap:{job_id}"}],
+        [{"text": "🗑 Descartar", "callback_data": f"del:{job_id}"}],
+    ]}
+
+
 def format_keyboard(pick_id: str) -> dict:
     """Video (Reel com personagem) ou carrossel (9 slides)."""
     return {"inline_keyboard": [
@@ -976,9 +986,20 @@ class Bot:
         caption = space_caption(
             (deck.get("caption") or "") + "\n\n" + " ".join(deck.get("hashtags") or [])
         )
-        self.say(chat_id, f"📝 Legenda:\n\n{caption}" if caption else
-                 "Carrossel pronto (sem legenda gerada).")
-        self.say(chat_id, f"🖼 {len(slides)} slides em {work / 'out'}")
+        # Vira job como o Reel, entao publicar, agendar e refazer legenda funcionam igual.
+        job_id = uuid.uuid4().hex[:10]
+        self.jobs[job_id] = {
+            "kind": "carousel",
+            "slides": [str(p) for p in slides],
+            "caption": caption,
+            "context": source.get("text", ""),
+            "created": time.time(),
+        }
+        save_jobs(self.project_dir, self.jobs)
+        self.say(chat_id,
+                 (f"📝 Legenda:\n\n{caption}\n\n" if caption else "")
+                 + f"🖼 {len(slides)} slides prontos. O que fazer?",
+                 carousel_keyboard(job_id))
 
     def prepare_from_file(self, chat_id: int, file_id: str, caption_text: str) -> None:
         progress = ProgressMessage(self.token, chat_id, "Preparando", PREPARE_STEPS)
@@ -1315,6 +1336,9 @@ class Bot:
         )
 
     def publish_instagram(self, chat_id: int, job: dict) -> bool:
+        if job.get("kind") == "carousel":
+            return self.publish_carousel(chat_id, job)
+
         video = Path(job["video"])
         if not video.is_file():
             self.say(chat_id, "O arquivo do video sumiu. Manda o link de novo.")
@@ -1361,6 +1385,44 @@ class Bot:
             (line for line in output.splitlines() if line.startswith("Musica:")), ""
         )
         progress.done(f"Pronto. Instagram: {post_line}" + (f"\n🎵 {music_line}" if music_line else ""))
+        return True
+
+    def publish_carousel(self, chat_id: int, job: dict) -> bool:
+        """Sobe os slides como album. Exige sessao instagrapi: a Graph API do
+        projeto so publica um arquivo por vez."""
+        slides = [Path(p) for p in job.get("slides", [])]
+        sumiram = [p for p in slides if not p.is_file()]
+        if not slides or sumiram:
+            self.say(chat_id, "Os slides sumiram do disco. Manda o link de novo.")
+            return False
+
+        session = self.project_dir / IG_SESSION_FILENAME
+        if not session.is_file():
+            self.say(chat_id, "Carrossel precisa da sessao do Instagram (/login ou "
+                              "/cookies). A Graph API aqui so publica um arquivo por vez.")
+            return False
+        if not self.session_ok():
+            self.say(chat_id, "⚠️ A sessao do Instagram expirou. Reconecte com /cookies "
+                              "ou /login — os slides continuam guardados.")
+            return False
+
+        progress = ProgressMessage(self.token, chat_id, "Publicando o carrossel",
+                                   ["Enviando os slides", "Finalizando o post"])
+        progress.stage(0)
+        progress.note(f"{len(slides)} imagens")
+        cmd = [self.python_bin, "instagrapi_publisher.py", "--publish-album",
+               *[str(p) for p in slides], "--caption", job.get("caption", "")]
+        result = subprocess.run(cmd, capture_output=True, text=True,
+                                cwd=str(self.project_dir))
+        output = (result.stdout or "").strip()
+        if result.returncode != 0:
+            progress.fail("Publicacao do carrossel falhou.\n"
+                          + (result.stderr or output).strip()[-500:])
+            return False
+        progress.stage(1)
+        linha = next((l for l in output.splitlines() if "Link:" in l or "Post ID" in l),
+                     "Publicado.")
+        progress.done(f"Pronto. {linha}")
         return True
 
     def publish_tiktok(self, chat_id: int, job: dict) -> bool:
@@ -1632,7 +1694,9 @@ class Bot:
             save_jobs(self.project_dir, self.jobs)
         elif action == "del":
             answer_callback(self.token, cb_id, "Descartado.")
-            Path(job["video"]).unlink(missing_ok=True)
+            # carrossel guarda varios PNGs em "slides"; Reel guarda um mp4 em "video"
+            for caminho in ([job["video"]] if job.get("video") else job.get("slides", [])):
+                Path(caminho).unlink(missing_ok=True)
             self.jobs.pop(job_id, None)
             save_jobs(self.project_dir, self.jobs)
             self.say(chat_id, "Descartado.")

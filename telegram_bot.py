@@ -556,18 +556,40 @@ class ProgressMessage:
         self._last_text = ""
         self._lock = threading.Lock()
         self._stop = threading.Event()
+        # o que cada etapa realmente achou: "4 frames de 23s", "@fulano - 37.330 views"
+        self._notes: dict[int, str] = {}
 
     def _render(self) -> str:
         spin = SPINNER_FRAMES[self._frame % len(SPINNER_FRAMES)]
         lines = [f"🎬 {self.title}", ""]
         for position, step in enumerate(self.steps):
+            note = self._notes.get(position, "")
             if position < self.index:
                 lines.append(f"✅ {step}")
+                if note:
+                    lines.append(f"      └ {note}")
             elif position == self.index:
                 lines.append(f"{spin} {step}...")
+                if note:
+                    lines.append(f"      └ {note}")
             else:
                 lines.append(f"▫️ {step}")
         return "\n".join(lines)
+
+    def note(self, text: str, index: int | None = None) -> None:
+        """Anota o resultado concreto da etapa, para o progresso deixar de ser generico.
+
+        "Pegando os frames" nao diz nada; "4 frames de 23s de video" diz o que o bot
+        achou e ajuda a entender onde ele travou quando trava.
+        """
+        with self._lock:
+            position = self.index if index is None else index
+            if position < 0:
+                return
+            self._notes[position] = text
+            self._frame += 1
+            rendered = self._render()
+        self._edit(rendered)
 
     def _edit(self, text: str) -> None:
         if self.message_id is None or text == self._last_text:
@@ -893,8 +915,9 @@ class Bot:
                               extract_frames, render_deck)
 
         progress = ProgressMessage(self.token, chat_id, "Montando o carrossel",
-                                   ["Lendo o post", "Pegando os frames",
-                                    "Escrevendo os slides", "Renderizando"])
+                                   ["Lendo o post", "Baixando o video",
+                                    "Lendo as telas", "Escrevendo os slides",
+                                    "Renderizando"])
         work = self.outputs / f"carousel_{uuid.uuid4().hex[:10]}"
         try:
             progress.stage(0)
@@ -902,29 +925,44 @@ class Bot:
             if not (source.get("text") or "").strip():
                 progress.fail("Nao consegui ler o texto desse post.")
                 return
+            autor = source.get("author") or "origem desconhecida"
+            views = source.get("views")
+            progress.note(f"@{autor}" + (f" · {views:,} views".replace(",", ".")
+                                         if isinstance(views, int) else ""))
 
             progress.stage(1)
             images: list[str] = []
             try:
                 video = download_from_url(url, self.downloads, self.project_dir,
                                           self.python_bin)
+                info = probe_video(video, self.python_bin)
+                secs = info.get("duration") or 0
                 images = [str(p) for p in extract_frames(video, work / "img", count=4)]
+                progress.note(f"{len(images)} frames de {secs:.0f}s de video"
+                              if secs else f"{len(images)} frames")
             except RuntimeError:
-                # post sem video ou download bloqueado: o carrossel funciona so com texto
-                images = []
+                # post sem video ou download bloqueado: o carrossel sai so com texto
+                progress.note("sem video — carrossel so com o texto do post")
 
             progress.stage(2)
             # Le o que esta escrito nas telas antes de escrever: o texto do post
             # costuma ser so uma frase de efeito, e o conteudo (precos, prazos,
             # numeros) esta na interface do video.
-            screens = describe_frames(images)
+            screens = describe_frames(images) if images else ""
+            progress.note(f"{len(screens.split())} palavras lidas das telas"
+                          if screens else "nada legivel nas telas")
+
+            progress.stage(3)
             deck = build_deck(source,
                               status=os.getenv("CAROUSEL_STATUS", "nao_verificado"),
                               screens=screens)
             if images:
                 attach_images(deck, images)
+            titulos = [s.get("title", "") for s in deck.get("slides", [])
+                       if s.get("type") != "cover"]
+            progress.note(" ".join(titulos[:4]) or f"{len(deck.get('slides', []))} slides")
 
-            progress.stage(3)
+            progress.stage(4)
             slides = render_deck(deck, work / "out")
         except Exception as exc:  # noqa: BLE001 - qualquer falha vira aviso no chat
             progress.fail(f"Nao consegui montar o carrossel.\n{exc}")

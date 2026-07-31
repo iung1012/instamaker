@@ -63,6 +63,11 @@ Regras de tamanho (o layout QUEBRA se estourar):
 
 Sao 9 slides no total: 1 capa + 7 de conteudo + 1 final de "me segue".
 Varie os tipos entre text, list, cards e checks. Devolva SOMENTE JSON valido.
+
+REGRA DE CONTEUDO: cada slide precisa de um fato concreto -- numero, preco, prazo,
+nome de botao, comparacao. Frases como "os criterios visam garantir integridade" ou
+"os indices refletem eficiencia" sao LIXO: nao dizem nada e servem para qualquer
+assunto. Se faltar informacao para 9 slides, aprofunde mais em vez de encher.
 """
     if status == "conceito":
         base += """
@@ -162,7 +167,32 @@ def attach_images(deck: dict, images: list[str], captions: list[str] | None = No
     return deck
 
 
-def build_deck(source: dict, status: str = "conceito") -> dict:
+VISION_PROMPT = (
+    "Estas sao telas de um video de demonstracao, em ordem. Descreva de forma "
+    "objetiva o que aparece em cada uma: textos visiveis, numeros, precos, prazos, "
+    "nomes de botoes e o que a interface esta fazendo. Nao interprete nem opine, "
+    "so relate o que da para ler na tela. Uma linha por tela."
+)
+
+
+def describe_frames(images: list) -> str:
+    """Le o que esta escrito nas telas do video.
+
+    Sem isso o redator so recebe o texto do post -- que em post de demo costuma ser
+    uma unica frase de efeito -- e preenche 9 slides inventando generalidades. Os
+    fatos que interessam (precos, prazos, numeros) estao na interface, nao no texto.
+    """
+    if not images:
+        return ""
+    import llm_client
+
+    try:
+        return llm_client.describe_images(images, VISION_PROMPT).strip()
+    except Exception:  # noqa: BLE001 - sem visao o carrossel ainda sai, so que pior
+        return ""
+
+
+def build_deck(source: dict, status: str = "conceito", screens: str = "") -> dict:
     """source: {text, author, url, views, likes}. status: confirmado|conceito|duvidoso."""
     import llm_client
 
@@ -171,7 +201,13 @@ def build_deck(source: dict, status: str = "conceito") -> dict:
         f"autor: @{(source.get('author') or '').lstrip('@')}\n"
         f"texto: {source.get('text', '')}\n"
         f"metricas: {source.get('views', '?')} views, {source.get('likes', '?')} likes\n\n"
-        f"Formato exato de saida:\n{SCHEMA_HINT}"
     )
+    if screens:
+        prompt += (
+            "O QUE APARECE NAS TELAS DO VIDEO — use estes fatos concretos (numeros, "
+            f"precos, prazos, nomes de botao) em vez de generalidades:\n{screens}\n\n"
+        )
+    prompt += f"Formato exato de saida:\n{SCHEMA_HINT}"
+
     deck = llm_client.chat_json(prompt, system=_rules(status))
     return _finish(_sanitize(deck), source)

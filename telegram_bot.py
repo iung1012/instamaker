@@ -889,7 +889,8 @@ class Bot:
         """Link -> 9 slides 1080x1350 + legenda, tudo entregue aqui no chat."""
         import shutil as _shutil
 
-        from carousel import attach_images, build_deck, extract_frames, render_deck
+        from carousel import (attach_images, build_deck, describe_frames,
+                              extract_frames, render_deck)
 
         progress = ProgressMessage(self.token, chat_id, "Montando o carrossel",
                                    ["Lendo o post", "Pegando os frames",
@@ -913,7 +914,13 @@ class Bot:
                 images = []
 
             progress.stage(2)
-            deck = build_deck(source, status=os.getenv("CAROUSEL_STATUS", "nao_verificado"))
+            # Le o que esta escrito nas telas antes de escrever: o texto do post
+            # costuma ser so uma frase de efeito, e o conteudo (precos, prazos,
+            # numeros) esta na interface do video.
+            screens = describe_frames(images)
+            deck = build_deck(source,
+                              status=os.getenv("CAROUSEL_STATUS", "nao_verificado"),
+                              screens=screens)
             if images:
                 attach_images(deck, images)
 

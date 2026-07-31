@@ -95,6 +95,53 @@ def chat(prompt: str, system: str | None = None, temperature: float = 0.8,
     return (choices[0].get("message") or {}).get("content") or ""
 
 
+def describe_images(paths: list, prompt: str, timeout: int = 240) -> str:
+    """Descreve imagens usando o modelo de visao (LLM_VISION_*).
+
+    Existe porque o modelo rapido de texto nao tem visao ("At most 0 image(s)"),
+    e sem ler as telas o redator escreve enchimento generico: em post de demo o
+    conteudo real (precos, prazos, numeros) esta no video, nao no texto do post.
+    """
+    import base64
+    import mimetypes
+    from pathlib import Path
+
+    key = (os.getenv("LLM_VISION_API_KEY") or os.getenv("LLM_API_KEY") or "").strip()
+    base = (os.getenv("LLM_VISION_BASE_URL") or os.getenv("LLM_BASE_URL")
+            or DEFAULT_BASE_URL).strip().rstrip("/")
+    model = (os.getenv("LLM_VISION_MODEL") or DEFAULT_MODEL).strip()
+    if not key:
+        raise LLMError("LLM_VISION_API_KEY/LLM_API_KEY nao configurada")
+
+    content: list[dict] = [{"type": "text", "text": prompt}]
+    for path in paths:
+        path = Path(path)
+        if not path.is_file():
+            continue
+        mime = mimetypes.guess_type(path.name)[0] or "image/png"
+        data = base64.b64encode(path.read_bytes()).decode("ascii")
+        content.append({"type": "image_url",
+                        "image_url": {"url": f"data:{mime};base64,{data}"}})
+    if len(content) == 1:
+        return ""
+
+    payload = json.dumps({"model": model,
+                          "messages": [{"role": "user", "content": content}],
+                          "temperature": 0.3}).encode("utf-8")
+    req = urllib.request.Request(
+        f"{base}/chat/completions", data=payload,
+        headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json",
+                 "User-Agent": "instamaker/1.0", "Accept": "application/json"},
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as response:
+            body = json.loads(response.read().decode("utf-8"))
+    except Exception as exc:  # noqa: BLE001 - visao e opcional, nao derruba o post
+        raise LLMError(f"visao falhou: {exc}") from exc
+    choices = body.get("choices") or []
+    return (choices[0].get("message") or {}).get("content", "") if choices else ""
+
+
 def chat_json(prompt: str, system: str | None = None, timeout: int = 180) -> dict:
     """Igual ao chat(), mas exige JSON de volta e tolera cerca de markdown."""
     raw = chat(

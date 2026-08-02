@@ -751,6 +751,56 @@ def format_keyboard(pick_id: str) -> dict:
     ]}
 
 
+CAROUSEL_THEMES = {
+    "blueprint": "📐 Blueprint (bege técnico)",
+    "dark": "🌑 Dark (fundo escuro)",
+    "minimal": "⬜ Minimal (branco limpo)",
+    "editorial": "🖼 Editorial (imagem cheia)",
+}
+
+
+def theme_keyboard(pick_id: str) -> dict:
+    """Qual visual usar. Escolhido ANTES de montar, porque o tema muda o
+    render e nao o texto — mas o render so acontece uma vez por job."""
+    rows = [
+        [{"text": rotulo, "callback_data": f"tem:{nome}:{pick_id}"}]
+        for nome, rotulo in CAROUSEL_THEMES.items()
+    ]
+    return {"inline_keyboard": rows}
+
+
+def watch_keyboard(cfg: dict) -> dict:
+    """Painel do vigia. Reflete o estado atual — o rotulo diz o que o clique FAZ."""
+    ligado = cfg.get("enabled")
+    publica = cfg.get("publish")
+    return {"inline_keyboard": [
+        [{"text": "⏸ Desligar busca" if ligado else "▶️ Ligar busca",
+          "callback_data": "wt:toggle"}],
+        [{"text": "🔒 Passar a revisar antes" if publica else "🚀 Publicar direto",
+          "callback_data": "wt:pub"}],
+        [{"text": "🔄 Procurar agora", "callback_data": "wt:now"}],
+    ]}
+
+
+def watch_status_text(cfg: dict, ultimo: float = 0.0) -> str:
+    perfis = ", ".join(cfg.get("profiles") or []) or "nenhum"
+    linhas = [
+        "<b>Vigia do X</b>",
+        f"busca: <b>{'ligada' if cfg.get('enabled') else 'desligada'}</b>",
+        f"ao achar: <b>{'publica direto' if cfg.get('publish') else 'manda para revisao'}</b>",
+        f"tema: {cfg.get('theme', 'blueprint')}",
+        f"intervalo minimo entre posts: {cfg.get('min_gap_minutes', 7)} min",
+        f"perfis: {perfis}",
+    ]
+    if ultimo:
+        faltam = cfg.get("min_gap_minutes", 7) * 60 - (time.time() - ultimo)
+        if faltam > 0:
+            linhas.append(f"proximo post liberado em {int(faltam // 60)}min {int(faltam % 60)}s")
+    linhas.append("")
+    linhas.append("<code>/vigia add @perfil</code> · <code>/vigia rm @perfil</code>")
+    return "\n".join(linhas)
+
+
 def schedule_keyboard(job_id: str, now: float | None = None) -> dict:
     """Slots de agendamento. O epoch vai inteiro no callback, ja resolvido em
     Brasilia, para o clique nao depender do fuso de quem clica."""
@@ -819,6 +869,9 @@ class Bot:
         self.use_saved_music = os.getenv("IG_USE_SAVED_MUSIC", "1").strip() not in {
             "0", "false", "no", "nao"
         }
+        # Repost da capa no stories depois de publicar o carrossel.
+        self.story_repost = os.getenv("IG_STORY_REPOST", "1").strip() not in {
+            "0", "off", "false", "nao", "no"}
         # Revisao visual do render (cabeca cortada / texto cortado) antes do
         # Publicar. Custa uma chamada ao Gemini por Reel.
         self.review_renders = os.getenv("AI_REVIEW_RENDERS", "1").strip() not in {
@@ -839,6 +892,8 @@ class Bot:
         self.drafts: dict[str, dict] = {}
         # link recebido esperando o usuario escolher video ou carrossel
         self.pending_format: dict[str, dict] = {}
+        self.watch_last_post = 0.0   # epoch da ultima publicacao do vigia
+        self.watch_chat = None        # chat que recebe os achados
         # Uma fila com um worker: o render come CPU e a maquina tem 2 vCPU,
         # entao processar em paralelo so faria os dois demorarem mais.
         self.queue: queue.Queue = queue.Queue()
@@ -972,7 +1027,8 @@ class Bot:
             exclude = Path(task[3]) if len(task) > 3 and task[3] else None
             self.render_draft(chat_id, task[2], exclude=exclude)
         elif kind == "carousel":
-            self.build_carousel(chat_id, task[2])
+            tema = task[3] if len(task) > 3 else "blueprint"
+            self.build_carousel(chat_id, task[2], tema)
 
     # -- fase 1: preparo e hook -------------------------------------------
     def prepare_from_url(self, chat_id: int, url: str) -> None:
@@ -988,8 +1044,12 @@ class Bot:
         self.offer_hook(chat_id, source, context, progress)
 
     # -- carrossel ---------------------------------------------------------
-    def build_carousel(self, chat_id: int, url: str) -> None:
-        """Link -> 9 slides 1080x1350 + legenda, tudo entregue aqui no chat."""
+    def build_carousel(self, chat_id: int, url: str, tema: str = "blueprint",
+                       auto: bool = False) -> None:
+        """Link -> 9 slides 1080x1350 + legenda, tudo entregue aqui no chat.
+
+        `tema` seleciona a pele do template (blueprint, dark, minimal,
+        editorial). Vai no deck e o template.html aplica no mount."""
         import shutil as _shutil
 
         from carousel import (attach_images, build_deck, describe_frames,
@@ -1037,6 +1097,7 @@ class Bot:
             deck = build_deck(source,
                               status=os.getenv("CAROUSEL_STATUS", "nao_verificado"),
                               screens=screens)
+            deck['template'] = tema   # o template.html aplica a pele no mount
             if images:
                 attach_images(deck, images)
             titulos = [s.get("title", "") for s in deck.get("slides", [])
@@ -1071,6 +1132,18 @@ class Bot:
             "created": time.time(),
         }
         save_jobs(self.project_dir, self.jobs)
+
+        if auto:
+            # Modo publicacao direta: o carrossel ja foi entregue no chat acima,
+            # entao o usuario ve o que foi ao ar mesmo sem ter aprovado.
+            self.say(chat_id, "🚀 Publicando direto (vigia em modo automatico)...")
+            try:
+                ok = self.publish_carousel(chat_id, self.jobs[job_id])
+                if not ok:
+                    self.say(chat_id, "⚠️ Nao consegui publicar. O carrossel ficou salvo.")
+            except Exception as exc:  # noqa: BLE001
+                self.say(chat_id, f"⚠️ Falha ao publicar: {exc}")
+            return
 
         teclado = carousel_keyboard(job_id, caption)
         titulo = deck["slides"][0]["lines"][0]["text"] if deck.get("slides") else "Carrossel"
@@ -1498,6 +1571,10 @@ class Bot:
         progress.note(f"{len(slides)} imagens")
         cmd = [self.python_bin, "instagrapi_publisher.py", "--publish-album",
                *[str(p) for p in slides], "--caption", job.get("caption", "")]
+        if self.use_saved_music:
+            # Sorteia uma das musicas salvas do perfil. Se a faixa falhar, o
+            # publisher cai para album sem musica em vez de abortar o post.
+            cmd.append("--music")
         result = subprocess.run(cmd, capture_output=True, text=True,
                                 cwd=str(self.project_dir))
         output = (result.stdout or "").strip()
@@ -1509,7 +1586,37 @@ class Bot:
         linha = next((l for l in output.splitlines() if "Link:" in l or "Post ID" in l),
                      "Publicado.")
         progress.done(f"Pronto. {linha}")
+
+        if self.story_repost:
+            self.repost_story(chat_id, slides, job.get("caption", ""))
         return True
+
+    def repost_story(self, chat_id: int, slides: list, caption: str = "") -> None:
+        """Sobe UM slide do carrossel no stories, para puxar trafego para o post.
+
+        A capa (01) e o slide que faz sentido no stories: e a que tem o gancho.
+        Falha aqui e avisada mas nao derruba nada — o carrossel ja foi publicado.
+        """
+        if not slides:
+            return
+        capa = slides[0]
+        cmd = [self.python_bin, "instagrapi_publisher.py", "--story", str(capa)]
+        if self.use_saved_music:
+            cmd.append("--music")
+        try:
+            r = subprocess.run(cmd, capture_output=True, text=True, timeout=300,
+                               cwd=str(self.project_dir))
+        except subprocess.TimeoutExpired:
+            self.say(chat_id, "⚠️ O story demorou demais. O carrossel esta publicado.")
+            return
+        if r.returncode == 0:
+            musica = next((l for l in (r.stdout or "").splitlines()
+                           if l.startswith("Musica:")), "")
+            self.say(chat_id, "📲 Capa repostada no stories." +
+                     (f"\n{musica}" if musica else ""))
+        else:
+            self.say(chat_id, "⚠️ Nao consegui subir o story. O carrossel esta publicado.\n"
+                     + (r.stderr or r.stdout or "").strip()[-300:])
 
     def publish_tiktok(self, chat_id: int, job: dict) -> bool:
         video = Path(job["video"])
@@ -1658,6 +1765,28 @@ class Bot:
             return
 
         # -- escolha do formato, antes de baixar qualquer coisa ---------
+        if action == "wt":
+            cfg = self.watch_cfg()
+            alvo = data.split(":", 1)[1] if ":" in data else ""
+            if alvo == "toggle":
+                cfg["enabled"] = not cfg.get("enabled")
+                self.watch_save(cfg)
+                answer_callback(self.token, cb_id,
+                                "Busca ligada" if cfg["enabled"] else "Busca desligada")
+            elif alvo == "pub":
+                cfg["publish"] = not cfg.get("publish")
+                self.watch_save(cfg)
+                answer_callback(self.token, cb_id,
+                                "Vai publicar direto" if cfg["publish"] else "Vai pedir revisao")
+            elif alvo == "now":
+                answer_callback(self.token, cb_id, "Procurando...")
+                self.watch_chat = chat_id
+                self.watch_last_post = 0.0
+            self.watch_chat = chat_id
+            self.say(chat_id, watch_status_text(cfg, self.watch_last_post),
+                     watch_keyboard(cfg))
+            return
+
         if action in {"fmv", "fmc"}:
             pick = self.pending_format.pop(job_id, None)
             if not pick:
@@ -1668,9 +1797,27 @@ class Bot:
                 self.say(chat_id, "🎬 Beleza, vai de vídeo.")
                 self.enqueue(("url", chat_id, pick["url"]))
             else:
-                answer_callback(self.token, cb_id, "Montando o carrossel...")
-                self.say(chat_id, "🖼 Beleza, vai de carrossel.")
-                self.enqueue(("carousel", chat_id, pick["url"]))
+                # Devolve o pick: o proximo clique (tema) ainda precisa da URL.
+                self.pending_format[job_id] = pick
+                answer_callback(self.token, cb_id, "Escolhe o visual")
+                self.say(chat_id, "🖼 Carrossel. Qual visual?",
+                         theme_keyboard(job_id))
+            return
+
+        if action == "tem":
+            # callback_data = tem:<tema>:<pick_id>
+            partes = data.split(":", 2)
+            tema = partes[1] if len(partes) > 2 else "blueprint"
+            pick_id = partes[2] if len(partes) > 2 else job_id
+            pick = self.pending_format.pop(pick_id, None)
+            if not pick:
+                answer_callback(self.token, cb_id, "Esse link expirou. Manda de novo.")
+                return
+            if tema not in CAROUSEL_THEMES:
+                tema = "blueprint"
+            answer_callback(self.token, cb_id, "Montando o carrossel...")
+            self.say(chat_id, f"🖼 Beleza, carrossel no visual {tema}.")
+            self.enqueue(("carousel", chat_id, pick["url"], tema))
             return
 
         # -- aprovacao do hook, antes de existir job --------------------
@@ -1881,6 +2028,11 @@ class Bot:
         if text.startswith("/id"):
             self.say(chat_id, f"Seu id: {user_id}")
             return
+        if text.startswith("/vigia"):
+            self.watch_chat = chat_id
+            self.cmd_vigia(chat_id, text)
+            return
+
         if text.startswith("/agendados"):
             self.say(chat_id, schedule_slots.scheduled_summary(self.jobs))
             return
@@ -2111,6 +2263,79 @@ class Bot:
         self.say(chat_id, "Manda um link de video ou o arquivo. /ajuda mostra os comandos.")
 
     # -- loop -------------------------------------------------------------
+    # -- vigia do X --------------------------------------------------------
+    def watch_cfg(self) -> dict:
+        import watcher
+        return watcher.carregar()
+
+    def watch_save(self, cfg: dict) -> None:
+        import watcher
+        watcher.salvar(cfg)
+
+    def watch_loop(self) -> None:
+        """Procura sem parar, respeitando o intervalo minimo entre publicacoes.
+
+        Sem timer do systemd: o laco vive junto do bot, entao ligar/desligar
+        e imediato e o estado e o mesmo que os botoes mostram.
+        """
+        import watcher
+        while True:
+            try:
+                cfg = self.watch_cfg()
+                if not cfg.get("enabled") or not cfg.get("profiles"):
+                    time.sleep(60)
+                    continue
+
+                gap = cfg.get("min_gap_minutes", 7) * 60
+                desde = time.time() - self.watch_last_post
+                if desde < gap:
+                    time.sleep(min(gap - desde, 60))
+                    continue
+
+                achados = []
+                ja = watcher.vistos()
+                for perfil in cfg["profiles"]:
+                    achados.extend([a for a in watcher.buscar_perfil(perfil, cfg)
+                                    if a["id"] not in ja])
+                if not achados:
+                    time.sleep(cfg.get("poll_seconds", 300))
+                    continue
+
+                escolhidos = watcher.escolher(achados, 1)
+                watcher.marcar({a["id"] for a in achados})
+                if not escolhidos:
+                    continue
+
+                item = escolhidos[0]
+                dono = self.watch_chat or (sorted(self.allowed)[0] if self.allowed else None)
+                if dono is None:
+                    time.sleep(300)
+                    continue
+
+                self.say(dono, f"🔍 Achei em {item['autor']}: <i>{item['texto'][:110]}</i>")
+                # Reaproveita o caminho normal: entrega no chat com os botoes.
+                # auto=True publica sozinho ao terminar.
+                self.build_carousel(dono, item["url"], cfg.get("theme", "blueprint"),
+                                    auto=bool(cfg.get("publish")))
+                self.watch_last_post = time.time()
+            except Exception as exc:  # noqa: BLE001
+                print(f"[vigia] {exc}", file=sys.stderr)
+                time.sleep(120)
+
+    def cmd_vigia(self, chat_id: int, text: str) -> None:
+        cfg = self.watch_cfg()
+        partes = text.split()
+        if len(partes) >= 3 and partes[1] in {"add", "rm"}:
+            perfil = "@" + partes[2].lstrip("@")
+            lista = cfg.setdefault("profiles", [])
+            if partes[1] == "add" and perfil not in lista:
+                lista.append(perfil)
+            elif partes[1] == "rm" and perfil in lista:
+                lista.remove(perfil)
+            self.watch_save(cfg)
+        self.say(chat_id, watch_status_text(cfg, self.watch_last_post),
+                 watch_keyboard(cfg))
+
     def run(self) -> int:
         me = api_call(self.token, "getMe")
         if not me.get("ok"):
@@ -2126,6 +2351,7 @@ class Bot:
             (self.cleanup_loop, "faxina"),
             (self.session_watch_loop, "sessao"),
             (self.schedule_loop, "agendador"),
+            (self.watch_loop, "vigia"),
         ):
             threading.Thread(target=target, name=name, daemon=True).start()
 

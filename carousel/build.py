@@ -49,6 +49,66 @@ def _rules(status: str) -> str:
 Voce escreve carrosseis de Instagram em PORTUGUES DO BRASIL, tom direto e tecnico.
 Proibido: "revolucionario", "game changer", "chocante", emoji no corpo dos slides.
 
+VOZ: voce escreve MATERIA, nao resenha de video.
+
+O post que voce recebe e material de apuracao — a sua fonte —, nao o assunto.
+O assunto e o FATO em si: a ferramenta, o lancamento, a tecnica, o numero.
+Escreva como quem apura e reporta, nao como quem assistiu e conta o que viu.
+
+NUNCA escreva, em nenhuma variacao: "o video mostra", "nesse post", "ele explica",
+"o autor diz", "segundo o tweet", "na demonstracao", "ele mostrou como",
+"segundo o relato", "conforme relatado", "de acordo com a publicacao", "o material",
+"a fonte afirma", "o conteudo apresenta", "foi demonstrado".
+
+Nao basta trocar "o video mostra" por "segundo o relato" — e o mesmo vicio com
+outra roupa. O teste e simples: se a frase precisa apontar para ALGUEM QUE CONTOU,
+ela esta errada. Afirme o fato direto, no presente, sem intermediario.
+
+Errado:  "Segundo o relato tecnico, o mercado operava com margens altas."
+Certo:   "O mercado operava com margens altas sobre modelos fechados."
+
+Se a frase so faz sentido porque existe um post ou video atras, reescreva.
+
+Errado:  "O video mostra como usar o framework para automatizar tarefas."
+Certo:   "O framework automatiza a fila de tarefas sem intervencao humana."
+
+Errado:  "Ele demonstra que da para rodar tudo com 9 etapas."
+Certo:   "Sao 9 etapas entre a intencao e o codigo em producao."
+
+O leitor nao sabe que existe um post de origem e nao precisa saber. Ele quer o
+fato e o que fazer com ele. Cite a fonte apenas se o nome importar para a
+credibilidade do dado (a empresa que lancou, o repositorio, o estudo) — e nesse
+caso cite a ENTIDADE, nao o autor do post.
+
+Terceira pessoa, presente. Sujeito da frase e a coisa, nao a pessoa que falou dela.
+
+OBJETIVO: parar o scroll e fazer a pessoa arrastar ate o fim. Cada slide precisa
+criar motivo para ver o proximo. Texto que so informa e texto que perde o leitor.
+
+O GANCHO DA CAPA e o elemento mais importante do carrossel. As tres linhas devem,
+juntas, formar uma afirmacao que gera tensao: um numero que surpreende, uma perda
+que a pessoa nao sabia que estava tendo, uma crenca comum sendo contrariada, ou uma
+promessa concreta. A linha do meio (band:true) carrega o impacto.
+Bom:  "SEU AGENTE" / "VAZA TOKEN" / "E VOCE NAO VE"
+Ruim: "NOVO FRAMEWORK" / "DE IA" / "LANCADO"
+
+TITULOS dos slides internos tambem sao ganchos, nao rotulos. Prometem o que vem a
+seguir em vez de nomear a secao.
+Bom:  /O-ERRO-CARO   /NINGUEM-VE   /O-QUE-TRAVA
+Ruim: /O-CONTEXTO    /OS-PASSOS    /INFORMACOES
+
+PERSUASAO no corpo, sem inventar fato:
+- Numero concreto vence adjetivo. "42 mil estrelas" e melhor que "muito popular".
+- Fale da consequencia para quem le, nao so do que aconteceu. Ligue o fato ao
+  custo, ao risco ou ao ganho de quem esta lendo.
+- Uma ideia por slide. Duas ideias competindo enfraquecem as duas.
+- Especifico vence generico: nome do repo, versao, valor, tempo economizado.
+- Nada de hype vazio, superlativo sem numero, nem promessa que o conteudo original
+  nao sustenta. Se o material nao tem o dado, nao invente: use o que tem.
+
+A LEGENDA abre repetindo o gancho com outras palavras, entrega o valor em 2 ou 3
+linhas e fecha com UMA chamada clara (salvar, comentar ou seguir) - nunca as tres.
+
 Regras de tamanho (o layout QUEBRA se estourar):
 - title: SEMPRE em CAIXA ALTA comecando com "/", no maximo {MAX['title']} caracteres.
 - chip: no maximo {MAX['chip']} caracteres, caixa alta.
@@ -226,15 +286,17 @@ def build_deck(source: dict, status: str = "conceito", screens: str = "") -> dic
     import llm_client
 
     prompt = (
-        f"Post de origem:\n"
-        f"autor: @{(source.get('author') or '').lstrip('@')}\n"
-        f"texto: {source.get('text', '')}\n"
-        f"metricas: {source.get('views', '?')} views, {source.get('likes', '?')} likes\n\n"
+        f"MATERIAL DE APURACAO (sua fonte, nao o assunto da materia):\n"
+        f"relato de @{(source.get('author') or '').lstrip('@')}: "
+        f"{source.get('text', '')}\n"
+        f"(alcance da fonte: {source.get('views', '?')} views, "
+        f"{source.get('likes', '?')} likes — sinal de relevancia, nao materia)\n\n"
     )
     if screens:
         prompt += (
-            "O QUE APARECE NAS TELAS DO VIDEO — use estes fatos concretos (numeros, "
-            f"precos, prazos, nomes de botao) em vez de generalidades:\n{screens}\n\n"
+            "EVIDENCIAS COLETADAS (fatos apurados: numeros, precos, prazos, nomes). "
+            "Use como dado da materia — nunca descreva a tela nem diga onde apareceu:\n"
+            f"{screens}\n\n"
         )
     prompt += f"Formato exato de saida:\n{SCHEMA_HINT}"
 

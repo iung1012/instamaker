@@ -61,3 +61,15 @@ telegram_downloads/
 .automation_state.json
 .ig_session.json
 .allowed_users.json
+
+# Backups automaticos das edicoes
+*.bak-*
+*.bak.*
+
+# Estado e config local do vigia do X
+watch.json
+.watch_state.json
+
+# Historico de publicacoes e saidas geradas
+history.json
+outputs/

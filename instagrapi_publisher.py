@@ -287,7 +287,8 @@ def do_publish(session_path: Path, video: Path, caption: str,
     return 0
 
 
-def do_publish_album(session_path: Path, images: list, caption: str) -> int:
+def do_publish_album(session_path: Path, images: list, caption: str,
+                     music: bool = False, music_name: str = "") -> int:
     """Publica um carrossel (album de fotos) no Instagram.
 
     O Instagram aceita de 2 a 10 imagens por album. O carrossel tem 9 slides,
@@ -303,11 +304,52 @@ def do_publish_album(session_path: Path, images: list, caption: str) -> int:
         return 1
 
     client = build_client(session_path)
-    media = client.album_upload([str(x) for x in paths], caption)
+
+    track = pick_saved_track(client, music_name) if music else None
+    media = None
+    if track:
+        nome = f"{track.get('title', '?')} — {track.get('display_artist', '?')}"
+        try:
+            media = client.album_upload_with_music(
+                [str(x) for x in paths], caption, track)
+            print(f"Musica: {nome}")
+        except Exception as exc:
+            # Album com musica falha mais que o normal (a API muda com frequencia).
+            # Melhor publicar sem musica do que nao publicar.
+            print(f"Aviso: musica falhou ({exc}); publicando sem.", file=sys.stderr)
+    if media is None:
+        media = client.album_upload([str(x) for x in paths], caption)
     print(f"Post ID: {getattr(media, 'pk', '')}")
     code = getattr(media, "code", "")
     if code:
         print(f"Link: https://www.instagram.com/p/{code}/")
+    return 0
+
+
+def do_publish_story(session_path: Path, image: str, caption: str = "",
+                     music: bool = False, music_name: str = "") -> int:
+    """Publica UMA imagem no stories. Serve para repostar um slide do carrossel."""
+    path = Path(image)
+    if not path.is_file():
+        print(f"Arquivo nao encontrado: {path}")
+        return 1
+
+    client = build_client(session_path)
+    track = pick_saved_track(client, music_name) if music else None
+
+    story = None
+    if track:
+        nome = f"{track.get('title', '?')} — {track.get('display_artist', '?')}"
+        try:
+            story = client.photo_upload_to_story_with_music(path, caption, track)
+            print(f"Musica: {nome}")
+        except Exception as exc:
+            print(f"Aviso: musica no story falhou ({exc}); publicando sem.",
+                  file=sys.stderr)
+    if story is None:
+        story = client.photo_upload_to_story(path, caption)
+
+    print(f"Story ID: {getattr(story, 'pk', '')}")
     return 0
 
 
@@ -323,6 +365,8 @@ def main() -> int:
                         help="Publica um carrossel de imagens.")
     action.add_argument("--whoami", action="store_true", help="Mostra a conta da sessao.")
     action.add_argument("--list-music", action="store_true", help="Lista as musicas salvas.")
+    action.add_argument("--story", metavar="IMG",
+                        help="Publica UMA imagem no stories (ex.: um slide do carrossel).")
     parser.add_argument("--caption", default="", help="Legenda do post.")
     parser.add_argument("--music", action="store_true",
                         help="Usa uma das musicas salvas no Instagram.")
@@ -355,7 +399,11 @@ def main() -> int:
                 print(f"- {track.get('title')} — {track.get('display_artist')}")
             return 0
         if args.publish_album:
-            return do_publish_album(session_path, args.publish_album, args.caption)
+            return do_publish_album(session_path, args.publish_album, args.caption,
+                                    music=args.music, music_name=args.music_name)
+        if args.story:
+            return do_publish_story(session_path, args.story, args.caption,
+                                    music=args.music, music_name=args.music_name)
         video = Path(args.publish)
         if not video.is_file():
             print(f"Video nao encontrado: {video}", file=sys.stderr)

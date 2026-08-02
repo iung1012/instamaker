@@ -1,0 +1,14 @@
+{
+  "enabled": false,
+  "profiles": [
+    "@perfil_de_referencia"
+  ],
+  "max_age_hours": 24,
+  "skip_retweets": true,
+  "skip_replies": true,
+  "theme": "blueprint",
+  "publish": false,
+  "max_per_run": 1,
+  "min_gap_minutes": 7,
+  "poll_seconds": 300
+}

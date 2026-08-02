@@ -62,6 +62,10 @@
   .body{margin-top:34px;font-size:37px;line-height:1.34;font-weight:600;max-width:960px}
   .body em{font-style:normal;color:var(--orange);font-weight:700}
   .body strong{font-weight:800}
+  /* O bloco de autor e a linha de credito sao do tema "post". Ficam
+     ocultos por padrao para nenhum tema existente mudar de aparencia. */
+  .autor{display:none}
+  .credito{display:none}
   .spacer{flex:1}
   /* texto sozinho: sem imagem nem bloco, o spacer empurrava tudo para cima e
      sobrava meio slide vazio. Centralizado, o vazio vira respiro proposital. */
@@ -222,10 +226,9 @@ let AUTOR = null;
 let CREDITO = "";
 
 const THEMES = {
-  blueprint: `.credito{display:none}`,
+  blueprint: '',
 
   dark: `
-.credito{display:none}
 :root{--orange:#ff5a2a;--ink:#f2ede1;--cream:#12110f;--cream-2:#1c1a17;--muted:#8c8578;
       --grid:rgba(255,255,255,.04);--grid-major:rgba(255,255,255,.08)}
 .chip{background:var(--ink);color:#12110f}
@@ -242,7 +245,6 @@ const THEMES = {
 `,
 
   minimal: `
-.credito{display:none}
 :root{--orange:#e8481f;--ink:#0d0d0d;--cream:#ffffff;--cream-2:#ffffff;--muted:#9a9a9a;
       --grid:transparent;--grid-major:transparent}
 .slide{padding:96px 96px 76px}
@@ -275,7 +277,6 @@ const THEMES = {
 `,
 
   editorial: `
-.credito{display:none}
 :root{--orange:#ff5a2a;--ink:#ffffff;--cream:#0a0a0a;--cream-2:rgba(255,255,255,.08);
       --muted:rgba(255,255,255,.66);--grid:transparent;--grid-major:transparent}
 .slide{position:relative;isolation:isolate}
@@ -320,7 +321,7 @@ h1.display,.cover h1{color:#fff;text-shadow:0 2px 24px rgba(10,10,10,.6)}
 .slide::after{display:none}
 
 /* Cabecalho do perfil: foto redonda, nome com selo, arroba embaixo. */
-.autor{display:flex;align-items:center;gap:22px;margin-bottom:44px;flex:none}
+.autor{display:flex !important;align-items:center;gap:22px;margin-bottom:44px;flex:none}
 .autor .avatar{width:88px;height:88px;border-radius:999px;object-fit:cover;
   background:#2a2d31;flex:none}
 .autor-nome{display:flex;align-items:center;gap:10px;
@@ -383,7 +384,7 @@ h1.display em{color:#e7e9ea}
 /* Capa segue o mesmo cartao: sem faixa laranja nem pilula. */
 /* order:-1 tira o credito de baixo da imagem: numa pagina cheia ele
    ficava fora dos 1350px. Assim fica colado ao texto. */
-.credito{margin-top:20px;margin-bottom:6px;order:-1;
+.credito{display:block !important;margin-top:20px;margin-bottom:6px;order:-1;
   font:400 26px Inter,sans-serif;color:var(--muted);flex:none}
 .cover{padding:74px 66px 66px;justify-content:flex-start}
 /* A capa do post e uma frase, nao tres linhas de cartaz: a caixa do

@@ -1,0 +1,268 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=1080">
+<title>Carousel Slide</title>
+<link rel="stylesheet" href="/style.css">
+
+<!-- Fontes locais -->
+<style>
+@font-face {
+  font-family: 'Anton';
+  src: url('/fonts/anton-v22-latin-regular.woff2') format('woff2');
+  font-weight: 400;
+  font-style: normal;
+  font-display: swap;
+}
+@font-face {
+  font-family: 'Inter';
+  src: url('/fonts/inter-v29-latin-300.woff2') format('woff2');
+  font-weight: 300;
+  font-display: swap;
+}
+@font-face {
+  font-family: 'Inter';
+  src: url('/fonts/inter-v29-latin-400.woff2') format('woff2');
+  font-weight: 400;
+  font-display: swap;
+}
+@font-face {
+  font-family: 'Inter';
+  src: url('/fonts/inter-v29-latin-600.woff2') format('woff2');
+  font-weight: 600;
+  font-display: swap;
+}
+@font-face {
+  font-family: 'Inter';
+  src: url('/fonts/inter-v29-latin-700.woff2') format('woff2');
+  font-weight: 700;
+  font-display: swap;
+}
+@font-face {
+  font-family: 'Inter';
+  src: url('/fonts/inter-v29-latin-800.woff2') format('woff2');
+  font-weight: 800;
+  font-display: swap;
+}
+@font-face {
+  font-family: 'IBM Plex Mono';
+  src: url('/fonts/ibm-plex-mono-v27-latin-400.woff2') format('woff2');
+  font-weight: 400;
+  font-display: swap;
+}
+@font-face {
+  font-family: 'IBM Plex Mono';
+  src: url('/fonts/ibm-plex-mono-v27-latin-500.woff2') format('woff2');
+  font-weight: 500;
+  font-display: swap;
+}
+</style>
+</head>
+<body>
+<div id="deck"></div>
+
+<script type="module">
+// mount(deck) é chamado pelo Playwright após carregar a página
+import { renderDeck } from '/render-slides.js';
+
+window.mount = function(deck) {
+  const deckEl = document.getElementById('deck');
+  // Deck tem array de slides — cada um vira uma .slide
+  for (const slideData of deck.slides) {
+    const html = renderSlide(slideData);
+    deckEl.insertAdjacentHTML('beforeend', html);
+  }
+  
+  // Esperar fontes carregarem antes do screenshot
+  if (document.fonts && document.fonts.ready) {
+    document.fonts.ready.then(() => {
+      deckEl.classList.add('loaded');
+    });
+  }
+};
+
+function renderSlide(d) {
+  if (d.type === 'cover') return renderCover(d);
+  return renderContent(d);
+}
+
+function renderCover(d) {
+  const brand = window.BRAND_NAME || 'CHASE AI';
+  const dateStr = d.date ? d.date.split('-').reverse().join('.') : new Date().toLocaleDateString('pt-BR');
+  
+  // Top specs
+  let topSpecLines = '';
+  (d.specTop || []).forEach(l => { topSpecLines += `<span>${l}</span>`; });
+  let topSpecRight = '';
+  (d.specTopRight || []).forEach(l => { topSpecRight += `<span>${l}</span>`; });
+  
+  // Lines
+  let linesHtml = '';
+  d.lines.forEach(line => {
+    if (line.band) {
+      linesHtml += `<div class="band"><span>${esc(line.text)}</span></div>`;
+    } else {
+      linesHtml += `<div>${esc(line.text)}</div>`;
+    }
+  });
+  
+  // Art image
+  let artImg = '';
+  if (d.artImage) {
+    artImg = `<img src="${esc(d.artImage)}" alt="art">`;
+  }
+  
+  // Bot specs
+  let botSpecLines = '';
+  (d.specBot || []).forEach(l => { botSpecLines += `<span>${esc(l)}</span>`; });
+  let botSpecRight = '';
+  (d.specBotRight || []).forEach(l => { botSpecRight += `<span>${esc(l)}</span>`; });
+  
+  return `
+  <div class="slide plain cover">
+    <div class="topspec">
+      <div class="l">${topSpecLines}</div>
+      <div class="r">${topSpecRight}</div>
+    </div>
+    
+    <div class="ruler">
+      <span>SPECimen A — VERIFIED</span>
+      <div class="line"></div>
+      <span>ISSUE ${new Date().getFullYear()} · #AI-DAILY</span>
+    </div>
+    
+    <h1>${linesHtml.replace(/<div[^>]*>/g, '').replace(/<\/div>/g, '')}</h1>
+    
+    <div class="art">${artImg}</div>
+    
+    ${d.pill ? `<div class="pill"><span class="tri">◆</span><span>${esc(d.pill)}</span></div>` : ''}
+    
+    <div class="botspec">
+      <div class="l">${botSpecLines}</div>
+      <div class="r">${botSpecRight}</div>
+    </div>
+  </div>`;
+}
+
+function renderContent(d) {
+  const sheetNum = parseInt((d.sheet || '').match(/\d+/)?.[0] || '02');
+  const sheetLabel = `SHEET ${String(sheetNum).padStart(2,'0')} / 09`;
+  
+  // Chip + Rule + Revision
+  const chipLabel = esc(d.chip || '');
+  const titleEsc = esc(d.title || '');
+  const figEsc = esc(d.fig || '');
+  const imageCaption = esc(d.imageCaption || '');
+  
+  let bodyHtml = '';
+  if (d.body) {
+    bodyHtml = d.body.map(b => `<p>${b}</p>`).join('');
+  }
+  
+  let imageFrame = '';
+  if (d.image) {
+    imageFrame = `
+    <div class="imgframe">
+      <img src="${esc(d.image)}" alt="fig">
+      <div class="k a"></div><div class="k b"></div>
+      <div class="k c"></div><div class="k d"></div>
+    </div>
+    ${imageCaption ? `<p class="imgcap">${imageCaption}</p>` : ''}`;
+  }
+  
+  // Type-specific blocks
+  let contentBlock = '';
+  
+  if (d.type === 'list' && d.items) {
+    let rows = '';
+    d.items.forEach(item => {
+      rows += `
+      <div class="row">
+        <span class="n">${esc(item.n || '')}</span>
+        <span class="t">${esc(item.t || '')}</span>
+        <span class="d">${esc(item.d || '')}</span>
+      </div>`;
+    });
+    contentBlock = `<div class="listbox">${rows}</div>`;
+  }
+  
+  if (d.type === 'cards' && d.cards) {
+    let cardsHtml = '';
+    d.cards.forEach(c => {
+      const darkClass = c.style === 'dark' ? ' dark' : '';
+      const outClass = c.style === 'out' ? ' out' : '';
+      cardsHtml += `
+      <div class="card${darkClass}${outClass}">
+        <p class="lbl">${esc(c.lbl || '')}</p>
+        <h3>${esc(c.h || '')}</h3>
+        <p>${esc(c.p || '')}</p>
+      </div>`;
+    });
+    contentBlock = `<div class="cards">
+      ${cardsHtml[0]}
+      <div class="arrow">▸</div>
+      ${cardsHtml[1]}
+    </div>`;
+  }
+  
+  if (d.type === 'checks' && d.checks) {
+    let checksHtml = '';
+    d.checks.forEach((c, i) => {
+      checksHtml += `
+      <div class="c">
+        <div class="dot">${i + 1}</div>
+        <span>${esc(c)}</span>
+      </div>`;
+    });
+    contentBlock = `
+    <div class="checks">
+      <p class="lbl">${esc(d.checksLabel || 'CHECKLIST')}</p>
+      ${checksHtml}
+    </div>`;
+  }
+  
+  // SM size?
+  const smClass = d.titleSize === 'sm' ? ' sm' : '';
+  
+  return `
+  <div class="slide">
+    <div class="crop tl"></div>
+    <div class="crop tr"></div>
+    <div class="crop bl"></div>
+    <div class="crop br"></div>
+    
+    <div class="head">
+      <div class="chip">${chipLabel}</div>
+      <div class="rule"><div class="line"></div>1080 PX<span class="rev">REV A ▲</span></div>
+    </div>
+    
+    <h1 class="display${smClass}">${titleEsc}</h1>
+    
+    <div class="figcap">
+      <div class="bar-o"></div>
+      <p>${figEsc}</p>
+    </div>
+    
+    <div class="body">${bodyHtml}</div>
+    
+    ${imageFrame ? imageFrame : ''}
+    
+    <div class="spacer"></div>
+    
+    ${contentBlock}
+    
+    <div class="foot">
+      <span>${sheetLabel}</span>
+      <span>${d.noSwipe ? '' : 'SWIPE →'}</span>
+    </div>
+  </div>`;
+}
+
+function esc(str) {
+  if (!str) return '';
+  return String(str).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+}
+</script>
+</body>
+</html>

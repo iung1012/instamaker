@@ -1,0 +1,21 @@
+{
+  "name": "carousel-gen",
+  "version": "1.0.0",
+  "type": "module",
+  "scripts": {
+    "start": "node src/run.js",
+    "preview": "npx serve out -l 3456",
+    "link": "node src/run-link.js",
+    "retema": "node src/retema.js"
+  },
+  "dependencies": {
+    "dotenv": "^16.4.7",
+    "rss-parser": "^3.13.0",
+    "sharp": "^0.34.4",
+    "@playwright/test": "^1.52.0",
+    "playwright": "^1.52.0",
+    "@fontsource/anton": "^5.2.8",
+    "@fontsource/inter": "^5.2.8",
+    "@fontsource/ibm-plex-mono": "^5.2.8"
+  }
+}

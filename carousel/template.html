@@ -171,7 +171,7 @@ function renderCover(s){
   const fs = longest <= 9 ? 168 : longest <= 11 ? 146 : longest <= 13 ? 126 : 108;
   const lines = s.lines.map(l =>
     l.band ? `<div class="band">${esc(l.text)}</div>` : `<div>${esc(l.text)}</div>`).join('');
-  return `<div class="slide plain cover">
+  return `<div class="slide plain cover">${autorBloco()}
     <div class="topspec"><div>${(s.specTop||[]).map(esc).join('<br>')}</div>
       <div class="r">${(s.specTopRight||[]).map(esc).join('<br>')}</div></div>
     <div class="ruler"><span class="line"></span>1080 PX<span class="line"></span></div>
@@ -206,22 +206,26 @@ function renderContent(s){
   const n = (s.title || '').length;
   const fs = n <= 9 ? 180 : n <= 11 ? 156 : n <= 13 ? 132 : n <= 15 ? 114 : 100;
   if(solo){
-    return `<div class="slide solo">${crops}${head(s.chip)}
+    return `<div class="slide solo">${crops}${head(s.chip)}${autorBloco()}
       <h1 class="display" style="font-size:${fs}px">${esc(s.title)}</h1>
       ${fig(s.fig)}<div class="fill"><div>${bodies(s.body)}</div></div>
-      ${foot(s.sheet)}</div>`;
+      ${creditoLinha()}${foot(s.sheet)}</div>`;
   }
-  return `<div class="slide">${crops}${head(s.chip)}
+  return `<div class="slide">${crops}${head(s.chip)}${autorBloco()}
     <h1 class="display" style="font-size:${fs}px">${esc(s.title)}</h1>
     ${fig(s.fig)}${bodies(s.body)}<div class="spacer"></div>
-    ${image(s)}${block}${foot(s.sheet)}</div>`;
+    ${image(s)}${block}${creditoLinha()}${foot(s.sheet)}</div>`;
 }
 
 
+let AUTOR = null;
+let CREDITO = "";
+
 const THEMES = {
-  blueprint: '',
+  blueprint: `.credito{display:none}`,
 
   dark: `
+.credito{display:none}
 :root{--orange:#ff5a2a;--ink:#f2ede1;--cream:#12110f;--cream-2:#1c1a17;--muted:#8c8578;
       --grid:rgba(255,255,255,.04);--grid-major:rgba(255,255,255,.08)}
 .chip{background:var(--ink);color:#12110f}
@@ -238,6 +242,7 @@ const THEMES = {
 `,
 
   minimal: `
+.credito{display:none}
 :root{--orange:#e8481f;--ink:#0d0d0d;--cream:#ffffff;--cream-2:#ffffff;--muted:#9a9a9a;
       --grid:transparent;--grid-major:transparent}
 .slide{padding:96px 96px 76px}
@@ -270,6 +275,7 @@ const THEMES = {
 `,
 
   editorial: `
+.credito{display:none}
 :root{--orange:#ff5a2a;--ink:#ffffff;--cream:#0a0a0a;--cream-2:rgba(255,255,255,.08);
       --muted:rgba(255,255,255,.66);--grid:transparent;--grid-major:transparent}
 .slide{position:relative;isolation:isolate}
@@ -304,11 +310,129 @@ h1.display,.cover h1{color:#fff;text-shadow:0 2px 24px rgba(10,10,10,.6)}
 .cover .pill{background:rgba(10,10,10,.58);border-color:#fff;color:#fff;box-shadow:none;
   backdrop-filter:blur(10px);-webkit-backdrop-filter:blur(10px)}
 `,
+
+  post: `
+:root{--orange:#1d9bf0;--ink:#ffffff;--cream:#000000;--cream-2:#16181c;
+      --muted:#71767b;--grid:transparent;--grid-major:transparent}
+
+.slide{padding:74px 66px 66px;justify-content:flex-start}
+.crop,.head,.foot,.figcap{display:none}
+.slide::after{display:none}
+
+/* Cabecalho do perfil: foto redonda, nome com selo, arroba embaixo. */
+.autor{display:flex;align-items:center;gap:22px;margin-bottom:44px;flex:none}
+.autor .avatar{width:88px;height:88px;border-radius:999px;object-fit:cover;
+  background:#2a2d31;flex:none}
+.autor-nome{display:flex;align-items:center;gap:10px;
+  font:800 38px/1.15 Inter,sans-serif;color:#e7e9ea;letter-spacing:-.02em}
+.autor-nome .selo{width:30px;height:30px;flex:none}
+.autor-arroba{font:400 32px/1.3 Inter,sans-serif;color:var(--muted)}
+
+/* O titulo vira a primeira frase do post, nao um rotulo condensado. */
+/* !important porque o render escreve font-size inline no h1, calculado para
+   a condensada. Aqui o titulo e uma frase e o base tem white-space:nowrap. */
+h1.display{font-family:Inter,sans-serif;font-weight:800;
+  font-size:58px !important;line-height:1.2;letter-spacing:-.03em;
+  text-transform:none;transform:none;white-space:normal;overflow-wrap:anywhere;
+  color:#e7e9ea;margin-top:0;margin-bottom:28px}
+h1.display em{color:#e7e9ea}
+
+/* O base centraliza o corpo no slide "solo" (.fill{flex:1;align-items:center}),
+   o que abre um buraco entre o titulo e o texto. No cartao de post o texto
+   segue o titulo, como num tweet. */
+.slide.solo .fill{flex:0;align-items:flex-start}
+.slide.solo .body{font-size:42px;line-height:1.5}
+/* O spacer empurra a midia para o rodape e abre um vao entre texto e
+   imagem. No cartao de post a imagem segue o texto; o vazio fica no fim. */
+.spacer{flex:0}
+
+.body{font:400 42px/1.5 Inter,sans-serif;color:#e7e9ea;max-width:100%;
+  margin-top:0}
+.body + .body{margin-top:34px}
+.body em{font-style:normal;font-weight:800;color:#e7e9ea}
+.body strong{font-weight:800;color:#e7e9ea}
+
+/* Midia com cantos arredondados, como o cartao real. */
+.imgframe{margin-top:34px;padding:0;border-radius:22px;overflow:hidden;flex:none}
+.imgframe img{width:100%;max-height:620px;object-fit:cover;border:0;display:block}
+.imgframe .k,.imgcap{display:none}
+
+/* Listas e cartoes viram blocos discretos sobre o preto. */
+.listbox,.checks{background:var(--cream-2);border:1px solid #2f3336;
+  border-radius:20px;padding:10px 34px;margin-top:36px}
+.listbox .row,.checks .c{border-color:#2f3336}
+.listbox .n{color:var(--orange);font:600 28px Inter,sans-serif}
+.listbox .t{font:800 38px Inter,sans-serif;text-transform:none;
+  letter-spacing:-.02em;color:#e7e9ea;width:280px}
+.listbox .d{color:var(--muted);font-size:28px}
+.checks .lbl{color:var(--muted)}
+.checks .dot{background:var(--orange);color:#000}
+.checks .c span{color:#e7e9ea;font-weight:400}
+
+.cards{margin-top:36px;grid-template-columns:1fr 64px 1fr}
+.card{background:var(--cream-2);border:1px solid #2f3336;border-radius:20px;
+  box-shadow:none;padding:34px 32px}
+.card.dark{background:var(--cream-2);color:#e7e9ea;border-color:#2f3336}
+.card.out{border-color:var(--orange)}
+.card .lbl{color:var(--muted)}
+.card h3{font:800 42px Inter,sans-serif;text-transform:none;
+  letter-spacing:-.02em;color:#e7e9ea}
+.card p,.card.dark p{color:var(--muted);font-size:28px}
+.arrow{color:var(--muted)}
+
+/* Capa segue o mesmo cartao: sem faixa laranja nem pilula. */
+/* order:-1 tira o credito de baixo da imagem: numa pagina cheia ele
+   ficava fora dos 1350px. Assim fica colado ao texto. */
+.credito{margin-top:20px;margin-bottom:6px;order:-1;
+  font:400 26px Inter,sans-serif;color:var(--muted);flex:none}
+.cover{padding:74px 66px 66px;justify-content:flex-start}
+/* A capa do post e uma frase, nao tres linhas de cartaz: a caixa do
+   headline nao pode crescer nem centralizar o texto. */
+.cover .headline{flex:0;display:block;margin-top:0}
+.cover h1 div{display:inline}
+.cover h1 div + div::before{content:' '}
+
+/* Sem imagem o slide fica muito preto: o texto cresce para ocupar. */
+.slide:not(:has(.imgframe)) .body{font-size:44px;line-height:1.46}
+.slide:not(:has(.imgframe)) h1.display{font-size:64px !important}
+.cover .topspec,.cover .botspec,.cover .ruler{display:none}
+.cover h1{font:800 62px/1.18 Inter,sans-serif !important;text-transform:none;
+  letter-spacing:-.03em;text-align:left;transform:none;white-space:normal;
+  overflow-wrap:anywhere;color:#e7e9ea}
+.cover .band{background:transparent;color:#e7e9ea;padding:0;margin:0;
+  box-shadow:none}
+.cover .art{margin-top:40px;border-radius:22px;overflow:hidden}
+.cover .pill{display:none}
+`,
 };
 window.THEMES = THEMES;
 
+
+function creditoLinha(){
+  return CREDITO
+    ? `<div class="credito">conteudo original: ${CREDITO}</div>`
+    : '';
+}
+
+function autorBloco(){
+  if (!AUTOR || !AUTOR.handle) return '';
+  const selo = AUTOR.verified
+    ? '<svg class="selo" viewBox="0 0 24 24"><path fill="#1d9bf0" d="M12 1l2.4 2.2 3.2-.4 1 3.1 2.9 1.5-1.2 3 1.2 3-2.9 1.5-1 3.1-3.2-.4L12 23l-2.4-2.2-3.2.4-1-3.1L2.5 16.6l1.2-3-1.2-3 2.9-1.5 1-3.1 3.2.4z"/><path fill="#fff" d="M10.6 15.6l-3-3 1.4-1.4 1.6 1.6 4-4 1.4 1.4z"/></svg>'
+    : '';
+  const foto = AUTOR.avatar
+    ? `<img class="avatar" src="${AUTOR.avatar}" alt="">`
+    : '<div class="avatar"></div>';
+  return `<div class="autor">${foto}
+    <div class="autor-txt">
+      <div class="autor-nome">${AUTOR.name || AUTOR.handle}${selo}</div>
+      <div class="autor-arroba">@${AUTOR.handle}</div>
+    </div></div>`;
+}
+
 window.mount = function(deck){
   HANDLE = deck.handle || '';
+  AUTOR = deck.author || null;
+  CREDITO = deck.credito || "";
   const tema = String(deck.template || 'blueprint').toLowerCase();
   document.getElementById('theme').textContent = THEMES[tema] || '';
   document.getElementById('stage').innerHTML =

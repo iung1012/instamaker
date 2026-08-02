@@ -756,6 +756,7 @@ CAROUSEL_THEMES = {
     "dark": "🌑 Dark (fundo escuro)",
     "minimal": "⬜ Minimal (branco limpo)",
     "editorial": "🖼 Editorial (imagem cheia)",
+    "post": "💬 Post (cartao de rede social)",
 }
 
 
@@ -769,35 +770,81 @@ def theme_keyboard(pick_id: str) -> dict:
     return {"inline_keyboard": rows}
 
 
+WATCH_THEMES = ["blueprint", "dark", "minimal", "editorial", "post"]
+
+
 def watch_keyboard(cfg: dict) -> dict:
-    """Painel do vigia. Reflete o estado atual — o rotulo diz o que o clique FAZ."""
+    """Painel do vigia. O rotulo diz o que o clique FAZ, nao o estado atual.
+    Nos temas o check mostra o estado, porque ali sao varios ao mesmo tempo."""
     ligado = cfg.get("enabled")
     publica = cfg.get("publish")
-    return {"inline_keyboard": [
+    marcados = set(cfg.get("themes") or [cfg.get("theme", "blueprint")])
+    rows = [
         [{"text": "⏸ Desligar busca" if ligado else "▶️ Ligar busca",
           "callback_data": "wt:toggle"}],
         [{"text": "🔒 Passar a revisar antes" if publica else "🚀 Publicar direto",
           "callback_data": "wt:pub"}],
-        [{"text": "🔄 Procurar agora", "callback_data": "wt:now"}],
-    ]}
+    ]
+    # Temas em duas colunas para nao virar uma torre de botoes.
+    linha = []
+    for t in WATCH_THEMES:
+        marca = "✅" if t in marcados else "▫️"
+        linha.append({"text": f"{marca} {t}", "callback_data": f"wt:tema:{t}"})
+        if len(linha) == 2:
+            rows.append(linha)
+            linha = []
+    if linha:
+        rows.append(linha)
+    # Um botao por perfil. O callback do Telegram tem teto de 64 bytes,
+    # e "wt:rmp:" + handle cabe folgado em qualquer @ do X (limite 15).
+    for p in (cfg.get("profiles") or []):
+        handle = p.lstrip("@")
+        rows.append([{"text": f"❌ remover @{handle}",
+                      "callback_data": f"wt:rmp:{handle}"}])
+
+    rows.append([{"text": "🔄 Procurar agora", "callback_data": "wt:now"}])
+    return {"inline_keyboard": rows}
 
 
 def watch_status_text(cfg: dict, ultimo: float = 0.0) -> str:
-    perfis = ", ".join(cfg.get("profiles") or []) or "nenhum"
+    """Texto puro: o send_message deste bot nao usa parse_mode, entao qualquer
+    tag HTML apareceria crua na tela. O Telegram linka as URLs sozinho."""
+    temas = [t for t in (cfg.get("themes") or []) if t] or [cfg.get("theme", "blueprint")]
     linhas = [
-        "<b>Vigia do X</b>",
-        f"busca: <b>{'ligada' if cfg.get('enabled') else 'desligada'}</b>",
-        f"ao achar: <b>{'publica direto' if cfg.get('publish') else 'manda para revisao'}</b>",
-        f"tema: {cfg.get('theme', 'blueprint')}",
-        f"intervalo minimo entre posts: {cfg.get('min_gap_minutes', 7)} min",
-        f"perfis: {perfis}",
+        "VIGIA DO X",
+        "",
+        "Busca ........ " + ("LIGADA" if cfg.get("enabled") else "desligada"),
+        "Ao achar ..... " + ("PUBLICA DIRETO" if cfg.get("publish")
+                             else "manda para revisao"),
+        "Temas ........ " + ", ".join(temas) + (" (sorteado)" if len(temas) > 1 else ""),
+        "Intervalo .... " + str(cfg.get("min_gap_minutes", 7)) + " min entre posts",
+        "",
+        "Assunto:",
+        "  " + (cfg.get("topic") or "(padrao)"),
+        "",
+        "Perfis de referencia:",
     ]
+    perfis = cfg.get("profiles") or []
+    if perfis:
+        for p in perfis:
+            linhas.append("  https://x.com/" + p.lstrip("@"))
+    else:
+        linhas.append("  nenhum cadastrado")
+
     if ultimo:
         faltam = cfg.get("min_gap_minutes", 7) * 60 - (time.time() - ultimo)
         if faltam > 0:
-            linhas.append(f"proximo post liberado em {int(faltam // 60)}min {int(faltam % 60)}s")
-    linhas.append("")
-    linhas.append("<code>/vigia add @perfil</code> · <code>/vigia rm @perfil</code>")
+            linhas += ["", "Proximo post liberado em "
+                       + str(int(faltam // 60)) + "min " + str(int(faltam % 60)) + "s"]
+
+    linhas += [
+        "",
+        "Comandos:",
+        "/vigia add @perfil — cadastra",
+        "/vigia rm @perfil — remove (ou use o botao no painel)",
+        "/vigia assunto <texto> — o que buscar",
+        "/vigia intervalo <min> — espera entre posts",
+    ]
     return "\n".join(linhas)
 
 
@@ -852,6 +899,9 @@ def menu_keyboard(is_admin: bool) -> dict:
         rows.append([
             {"text": "👥 Usuarios", "callback_data": "menu:usuarios"},
             {"text": "📷 Conta", "callback_data": "menu:conta"},
+        ])
+        rows.append([
+            {"text": "🔍 Vigia do X", "callback_data": "menu:vigia"},
         ])
     return {"inline_keyboard": rows}
 
@@ -954,6 +1004,32 @@ class Bot:
             "",
             "/fila — o que esta em andamento",
             "/agendados — Reels com hora marcada",
+            "",
+            "🖼 Carrossel",
+            "Ao mandar um link, escolha 'Carrossel (9 slides)' e depois o",
+            "visual. Sao 4 temas:",
+            "   blueprint — bege tecnico, com grade e marcas de corte",
+            "   dark — o mesmo, fundo escuro",
+            "   minimal — branco limpo, sem grade",
+            "   editorial — a imagem ocupa o slide inteiro",
+            "   post — cartao de rede social, com sua foto, nome e @",
+            "",
+            "🔍 Vigia do X — /vigia",
+            "Procura sozinho nos perfis que voce cadastrar e monta carrossel",
+            "do que achar relevante. Botoes do painel:",
+            "   Ligar/Desligar busca — liga o robo. Desligado, ele nao procura",
+            "   Publicar direto / Revisar antes — no automatico ele publica",
+            "      sozinho; no manual manda os slides e voce clica em publicar",
+            "   Temas (✅/▫️) — marque um ou varios. Com varios, ele sorteia",
+            "      um a cada post, para o feed nao ficar repetitivo",
+            "   Procurar agora — forca um ciclo e ignora a espera de 7 min",
+            "",
+            "/vigia add @perfil — cadastra um perfil de referencia",
+            "/vigia rm @perfil — remove",
+            "/vigia assunto <texto> — define o que ele deve procurar",
+            "   ex: /vigia assunto agentes de IA e automacao para devs",
+            "/vigia intervalo <min> — espera minima entre publicacoes",
+            "   ex: /vigia intervalo 30 (padrao 7, minimo 1)",
             "",
             "🎭 Personagens",
             "/personagens — lista a biblioteca",
@@ -1096,8 +1172,16 @@ class Bot:
             progress.stage(3)
             deck = build_deck(source,
                               status=os.getenv("CAROUSEL_STATUS", "nao_verificado"),
-                              screens=screens)
+                              screens=screens,
+                              template=tema)
             deck['template'] = tema   # o template.html aplica a pele no mount
+            # Identidade do perfil (nome, @, foto) para o tema de cartao de post.
+            # Cache de 24h: falha aqui nao derruba o carrossel.
+            try:
+                from carousel.profile import carregar_perfil
+                deck['author'] = carregar_perfil()
+            except Exception as exc:
+                print(f'[perfil] {exc}')
             if images:
                 attach_images(deck, images)
             titulos = [s.get("title", "") for s in deck.get("slides", [])
@@ -1761,6 +1845,10 @@ class Bot:
 
         if action == "menu":
             answer_callback(self.token, cb_id)
+            if job_id == "vigia":
+                self.watch_chat = chat_id
+                self.cmd_vigia(chat_id, "/vigia")
+                return
             self.handle_menu(chat_id, user_id, job_id)
             return
 
@@ -1778,6 +1866,31 @@ class Bot:
                 self.watch_save(cfg)
                 answer_callback(self.token, cb_id,
                                 "Vai publicar direto" if cfg["publish"] else "Vai pedir revisao")
+            elif alvo.startswith("rmp:"):
+                handle = "@" + alvo.split(":", 1)[1].lstrip("@")
+                lista = cfg.get("profiles") or []
+                if handle in lista:
+                    lista.remove(handle)
+                    cfg["profiles"] = lista
+                    self.watch_save(cfg)
+                    answer_callback(self.token, cb_id, f"{handle} removido")
+                else:
+                    answer_callback(self.token, cb_id, "Ja tinha sido removido")
+            elif alvo.startswith("tema:"):
+                t = alvo.split(":", 1)[1]
+                marcados = [x for x in (cfg.get("themes") or
+                                        [cfg.get("theme", "blueprint")]) if x]
+                if t in marcados:
+                    # Nunca deixar zerado: sem tema o render nao sabe o que aplicar.
+                    if len(marcados) > 1:
+                        marcados.remove(t)
+                    else:
+                        answer_callback(self.token, cb_id, "Precisa de pelo menos um tema")
+                else:
+                    marcados.append(t)
+                cfg["themes"] = marcados
+                self.watch_save(cfg)
+                answer_callback(self.token, cb_id, ", ".join(marcados))
             elif alvo == "now":
                 answer_callback(self.token, cb_id, "Procurando...")
                 self.watch_chat = chat_id
@@ -2301,7 +2414,7 @@ class Bot:
                     time.sleep(cfg.get("poll_seconds", 300))
                     continue
 
-                escolhidos = watcher.escolher(achados, 1)
+                escolhidos = watcher.escolher(achados, 1, cfg)
                 watcher.marcar({a["id"] for a in achados})
                 if not escolhidos:
                     continue
@@ -2315,7 +2428,8 @@ class Bot:
                 self.say(dono, f"🔍 Achei em {item['autor']}: <i>{item['texto'][:110]}</i>")
                 # Reaproveita o caminho normal: entrega no chat com os botoes.
                 # auto=True publica sozinho ao terminar.
-                self.build_carousel(dono, item["url"], cfg.get("theme", "blueprint"),
+                tema = watcher.sortear_tema(cfg)
+                self.build_carousel(dono, item["url"], tema,
                                     auto=bool(cfg.get("publish")))
                 self.watch_last_post = time.time()
             except Exception as exc:  # noqa: BLE001
@@ -2325,7 +2439,18 @@ class Bot:
     def cmd_vigia(self, chat_id: int, text: str) -> None:
         cfg = self.watch_cfg()
         partes = text.split()
-        if len(partes) >= 3 and partes[1] in {"add", "rm"}:
+        if len(partes) >= 3 and partes[1] == "assunto":
+            cfg["topic"] = text.split("assunto", 1)[1].strip()
+            self.watch_save(cfg)
+        elif len(partes) >= 3 and partes[1] == "intervalo":
+            try:
+                # Piso de 1 min: abaixo disso vira rajada e o Instagram limita.
+                cfg["min_gap_minutes"] = max(1, int(partes[2]))
+                self.watch_save(cfg)
+            except ValueError:
+                self.say(chat_id, "Use um numero. Ex: /vigia intervalo 15")
+                return
+        elif len(partes) >= 3 and partes[1] in {"add", "rm"}:
             perfil = "@" + partes[2].lstrip("@")
             lista = cfg.setdefault("profiles", [])
             if partes[1] == "add" and perfil not in lista:

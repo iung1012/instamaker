@@ -73,3 +73,6 @@ watch.json
 # Historico de publicacoes e saidas geradas
 history.json
 outputs/
+
+# Cache do perfil do Instagram (foto em base64, renovado a cada 24h)
+.profile_cache.json

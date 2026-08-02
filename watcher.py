@@ -51,7 +51,9 @@ PADRAO = {
     "max_age_hours": 24,
     "skip_retweets": True,
     "skip_replies": True,
-    "theme": "blueprint",
+    "theme": "blueprint",          # compatibilidade: tema unico antigo
+    "themes": ["blueprint"],       # sorteia entre estes a cada post
+    "topic": "IA, ferramentas e novidades para quem constroi com IA",
     "publish": False,          # publicar sozinho e opt-in explicito
     "max_per_run": 1,
 }
@@ -137,7 +139,7 @@ def _tag(bloco: str, nome: str) -> str:
 
 
 # ---------------------------------------------------------------- selecao
-def escolher(candidatos: list[dict], quantos: int) -> list[dict]:
+def escolher(candidatos: list[dict], quantos: int, cfg: dict | None = None) -> list[dict]:
     """Pede ao modelo para ranquear por relevancia em IA. Se o LLM falhar,
     cai para ordem cronologica — melhor publicar o mais novo do que travar."""
     if len(candidatos) <= quantos:
@@ -146,13 +148,16 @@ def escolher(candidatos: list[dict], quantos: int) -> list[dict]:
     try:
         import llm_client
         lista = "\n".join(f"{i}. {c['texto'][:220]}" for i, c in enumerate(candidatos))
+        assunto = (cfg or {}).get("topic") or PADRAO["topic"]
         prompt = (
-            "Voce seleciona pauta para um perfil tecnico de IA.\n\n"
+            f"Voce seleciona pauta sobre: {assunto}\n\n"
             f"Candidatos:\n{lista}\n\n"
-            f"Escolha os {quantos} mais relevantes para quem CONSTROI com IA. "
-            "Priorize: lancamento concreto, ferramenta utilizavel, numero ou "
-            "benchmark, mudanca que afeta o trabalho de quem programa. "
-            "Descarte: opiniao solta, thread motivacional, promocao de curso.\n\n"
+            f"Escolha os {quantos} mais relevantes para esse assunto. "
+            "Priorize: fato concreto, ferramenta utilizavel, numero ou "
+            "benchmark, mudanca que afeta o trabalho de quem le. "
+            "Descarte: opiniao solta, thread motivacional, promocao de curso. "
+            "Se NENHUM servir ao assunto, devolva lista vazia — melhor nao "
+            "publicar do que publicar fora de pauta.\n\n"
             'Responda so JSON: {"escolhidos": [indices]}'
         )
         r = llm_client.chat_json(prompt)
@@ -166,6 +171,13 @@ def escolher(candidatos: list[dict], quantos: int) -> list[dict]:
 
 
 # ---------------------------------------------------------------- producao
+def sortear_tema(cfg: dict) -> str:
+    """Um dos temas marcados. Com varios, o feed nao fica monotono."""
+    import random
+    lista = [t for t in (cfg.get("themes") or []) if t]
+    return random.choice(lista) if lista else cfg.get("theme", "blueprint")
+
+
 def produzir(item: dict, cfg: dict) -> bool:
     """Monta o carrossel e, se configurado, publica."""
     sys.path.insert(0, str(BASE))
@@ -192,9 +204,11 @@ def produzir(item: dict, cfg: dict) -> bool:
         log(f"  sem frames ({exc})")
 
     telas = describe_frames(imagens) if imagens else ""
+    # Sorteia UMA vez: o prompt e o render precisam do mesmo tema.
+    tema = sortear_tema(cfg)
     deck = build_deck(source, status=os.getenv("CAROUSEL_STATUS", "nao_verificado"),
-                      screens=telas)
-    deck["template"] = cfg.get("theme", "blueprint")
+                      screens=telas, template=tema)
+    deck["template"] = tema
     if imagens:
         attach_images(deck, imagens)
 
@@ -241,7 +255,7 @@ def ciclo() -> int:
         log("nada novo")
         return 0
 
-    escolhidos = escolher(candidatos, cfg["max_per_run"])
+    escolhidos = escolher(candidatos, cfg["max_per_run"], cfg)
     log(f"{len(candidatos)} candidatos -> {len(escolhidos)} escolhido(s)")
 
     # Marca TODOS os vistos, nao so os escolhidos: os descartados nao devem
@@ -266,7 +280,8 @@ def main() -> int:
     ap.add_argument("--off", action="store_true", help="desliga a busca")
     ap.add_argument("--publish-on", action="store_true", help="liga a publicacao automatica")
     ap.add_argument("--publish-off", action="store_true", help="desliga a publicacao automatica")
-    ap.add_argument("--theme", metavar="TEMA", help="tema dos carrosseis")
+    ap.add_argument("--theme", metavar="TEMA",
+                help="tema: blueprint|dark|minimal|editorial|post")
     a = ap.parse_args()
 
     cfg = carregar()

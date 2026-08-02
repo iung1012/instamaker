@@ -24,6 +24,45 @@ MAX = {  # limites que o layout aguenta sem vazar
     "cover_line": 14,
 }
 
+# O tema "post" usa fonte normal em caixa mista: cabe muito mais texto que
+# a condensada, e o titulo e uma frase, nao um rotulo.
+MAX_POST = dict(MAX, title=62, body=260, item_t=18, item_d=90,
+                card_h=20, card_p=130, check=44, cover_line=34, pill=60)
+
+
+def _titulo_frase(texto: str) -> str:
+    """Converte "/DIVERSIFICAR" em "Diversificar".
+
+    O tema post nao usa barra nem caixa alta. Titulo que ja venha em frase
+    passa intacto — so mexe no que veio no formato antigo.
+    """
+    t = (texto or "").strip().lstrip("/").strip()
+    if not t:
+        return t
+    letras = [c for c in t if c.isalpha()]
+    if letras and all(c.isupper() for c in letras):
+        # Todo em caixa alta: vira frase, preservando siglas de 2-3 letras.
+        palavras = []
+        for p in t.split():
+            palavras.append(p if (len(p) <= 3 and p.isalpha()) else p.capitalize())
+        t = " ".join(palavras)
+        t = t[0].upper() + t[1:] if t else t
+    return t.replace("-", " ")
+
+
+def _maybe_upper(texto: str, alta: bool) -> str:
+    return texto.upper() if alta else texto
+
+
+def _limites(template: str) -> dict:
+    return MAX_POST if str(template).lower() == "post" else MAX
+
+
+def _caixa_alta(template: str) -> bool:
+    """Só o blueprint e derivados usam caixa alta nos rotulos."""
+    return str(template).lower() != "post"
+
+
 SCHEMA_HINT = """
 {
   "caption": "legenda do Instagram em PT-BR, 3 a 5 linhas curtas separadas por \\n\\n, com CTA no fim",
@@ -44,7 +83,68 @@ SCHEMA_HINT = """
 """
 
 
-def _rules(status: str) -> str:
+SCHEMA_POST = """
+{
+  "caption": "legenda do Instagram em PT-BR, 3 a 5 linhas curtas separadas por \\n\\n, com CTA no fim",
+  "hashtags": ["#ia", "..."],
+  "credito": "@perfil_de_origem",
+  "slides": [
+    {"type":"cover","lines":[{"text":"Primeira parte do gancho"},
+                             {"text":"segunda parte","band":true},
+                             {"text":"e o fecho"}],
+     "pill":"frase curta de apoio"},
+    {"type":"text","title":"O que mudou de fato","body":["...","..."]},
+    {"type":"text","title":"Como o mecanismo funciona","body":["..."]},
+    {"type":"text","title":"O numero que importa","body":["..."]},
+    {"type":"list","title":"Onde isso pega de verdade","body":["..."],
+     "items":[{"n":"01","t":"TITULO","d":"descricao"}]},
+    {"type":"cards","title":"O custo que ninguem cita","body":["..."],
+     "cards":[{"style":"dark","lbl":"HOJE","h":"TITULO","p":"..."},
+              {"style":"out","lbl":"DEPOIS","h":"TITULO","p":"..."}]},
+    {"type":"checks","title":"O que fazer com isso","body":["..."],
+     "checksLabel":"NA PRATICA","checks":["...","...","...","..."]},
+    {"type":"text","title":"A prova tecnica","body":["..."]},
+    {"type":"text","title":"Resumindo","body":["...","..."]},
+    {"type":"text","title":"Salva e segue","body":["..."]}
+  ]
+}
+"""
+
+
+def _rules(status: str, template: str = "blueprint") -> str:
+    # O tema "post" nao usa a condensada em caixa alta: titulo com "/" e
+    # capa de tres linhas soltas ficam sem sentido num cartao de rede social.
+    formato_post = """
+
+FORMATO DESTE CARROSSEL: cartao de rede social, com 10 SLIDES e papel fixo
+para cada um. Respeite a ordem — ela e a narrativa:
+
+  1  GANCHO. Uma frase de efeito persuasiva que para o scroll. Tensao, numero
+     que surpreende ou crenca contrariada. Sem explicar ainda. (leva imagem)
+  2  O QUE E. Apresenta o fato principal em duas ou tres frases. (leva imagem)
+  3  COMO FUNCIONA. O mecanismo, com dado concreto. (leva imagem)
+  4  O NUMERO. O dado mais forte do material, com o que ele significa. (leva imagem)
+  5  APROFUNDAMENTO. So texto, sem imagem. Uma camada que o leitor nao viu.
+  6  A RESSALVA. So texto. O limite, o custo, o que pode dar errado.
+  7  O QUE FAZER. So texto. Aplicacao pratica para quem le.
+  8  A PROVA. O detalhe tecnico que sustenta tudo. (leva imagem)
+  9  RESUMO. Amarra o carrossel inteiro em 3 ou 4 linhas curtas. Sem imagem.
+ 10  CTA. So a chamada: salvar e seguir. Curto, duas linhas no maximo.
+     Sem imagem, sem dado novo.
+
+Slides 5, 6, 7, 9 e 10 NAO devem ter imagem — escreva um pouco mais neles,
+porque a pagina fica so com texto.
+- title: uma FRASE curta em caixa normal, ate 60 caracteres, SEM barra "/"
+  no inicio e SEM caixa alta. Deve continuar a leitura, nao rotular a secao.
+  Bom:  "O modelo escreve o jogo inteiro sozinho"
+  Ruim: "/OS-PASSOS"
+- cover.lines: as 3 linhas sao lidas como UMA frase corrida, entao escreva
+  uma afirmacao completa quebrada em 3 partes, com sujeito e verbo.
+  Bom:  ["Um comando gerou", "um jogo inteiro", "em trinta horas"]
+  Ruim: ["UM UNICO", "SIMULA MOTORES", "COM VALIDACAO"]
+- Sem chip e sem "FIG.N": esse tema nao mostra esses elementos.
+"""
+
     base = f"""
 Voce escreve carrosseis de Instagram em PORTUGUES DO BRASIL, tom direto e tecnico.
 Proibido: "revolucionario", "game changer", "chocante", emoji no corpo dos slides.
@@ -143,10 +243,15 @@ O carrossel NAO pode afirmar que foi lancado. A capa deve deixar claro que e hip
         # da empresa citada. Post viral com mockup convincente e comum, e publicar
         # "fulano lancou X" sem confirmacao vira desinformacao no perfil do usuario.
         base += """
-NINGUEM CONFIRMOU o que o post afirma. Escreva de forma atribuida, nunca como fato
-proprio: use "segundo o post", "o video mostra", "a proposta e". NAO escreva que uma
-empresa lancou, anunciou ou confirmou nada. A capa nao pode afirmar que existe.
+NINGUEM CONFIRMOU o que o material afirma. Escreva de forma atribuida SEM apontar
+para o post ou o video: use "a proposta e", "o projeto promete", "segundo a
+documentacao", "o anuncio diz". NAO escreva que uma empresa lancou, anunciou ou
+confirmou nada. A capa nao pode afirmar que existe. Mantenha a regra de voz: nada
+de "o video mostra" nem "segundo o post" — atribua a ENTIDADE, nao a quem contou.
 """
+    if str(template).lower() == "post":
+        base += formato_post
+
     return base
 
 
@@ -188,34 +293,44 @@ def _clip(value: str, limit: int, word_safe: bool = False) -> str:
     return value[: limit - 1].rstrip() + "…"
 
 
-def _sanitize(deck: dict) -> dict:
+def _sanitize(deck: dict, template: str = "blueprint") -> dict:
+    M = _limites(template)
+    alta = _caixa_alta(template)
     """Corta o que estourou. O prompt e a primeira barreira; isto e a garantia."""
     for slide in deck.get("slides", []):
         if slide.get("type") == "cover":
             slide["lines"] = [
-                {"text": _clip(l.get("text", ""), MAX["cover_line"], word_safe=True).upper(),
+                {"text": _maybe_upper(_clip(l.get("text", ""), M["cover_line"], word_safe=True), alta),
                  **({"band": True} if l.get("band") else {})}
                 for l in (slide.get("lines") or [])[:3]
             ]
-            slide["pill"] = _clip(slide.get("pill", ""), MAX["pill"])
+            slide["pill"] = _clip(slide.get("pill", ""), M["pill"])
             continue
-        slide["title"] = _clip(slide.get("title", ""), MAX["title"], word_safe=True).upper()
-        slide["chip"] = _clip(slide.get("chip", ""), MAX["chip"]).upper()
-        slide["body"] = [_capitalize(_clip(b, MAX["body"]))
+        titulo = _clip(slide.get("title", ""), M["title"], word_safe=True)
+        slide["title"] = (_maybe_upper(titulo, alta) if alta
+                          else _titulo_frase(titulo))
+        slide["chip"] = _maybe_upper(_clip(slide.get("chip", ""), M["chip"]), alta)
+        slide["body"] = [_capitalize(_clip(b, M["body"]))
                          for b in (slide.get("body") or [])[:2]]
         for item in slide.get("items", [])[:4]:
-            item["t"] = _clip(item.get("t", ""), MAX["item_t"], word_safe=True).upper()
-            item["d"] = _clip(item.get("d", ""), MAX["item_d"])
+            item["t"] = _maybe_upper(_clip(item.get("t", ""), M["item_t"], word_safe=True), alta)
+            item["d"] = _clip(item.get("d", ""), M["item_d"])
         for card in slide.get("cards", [])[:2]:
-            card["h"] = _clip(card.get("h", ""), MAX["card_h"], word_safe=True).upper()
-            card["p"] = _clip(card.get("p", ""), MAX["card_p"])
+            card["h"] = _maybe_upper(_clip(card.get("h", ""), M["card_h"], word_safe=True), alta)
+            card["p"] = _clip(card.get("p", ""), M["card_p"])
         if slide.get("checks"):
-            slide["checks"] = [_clip(c, MAX["check"]) for c in slide["checks"][:4]]
+            slide["checks"] = [_clip(c, M["check"]) for c in slide["checks"][:4]]
     return deck
 
 
 def _finish(deck: dict, source: dict) -> dict:
     slides = deck.get("slides", [])
+
+    # Credito de quem publicou o material original. Sai do source, nao do
+    # modelo: assim nunca vem inventado.
+    autor = (source.get("author") or "").lstrip("@")
+    if autor:
+        deck["credito"] = f"@{autor}"
     total = len(slides)
     for index, slide in enumerate(slides, start=1):
         if slide.get("type") != "cover":
@@ -247,7 +362,21 @@ def attach_images(deck: dict, images: list[str], captions: list[str] | None = No
     lista de 4 passos aparecendo com 2. Perder conteudo e pior que ter menos imagem.
     """
     captions = captions or []
-    targets = [s for s in deck.get("slides", []) if s.get("type") == "text"]
+    slides = deck.get("slides", [])
+
+    if str(deck.get("template", "")).lower() == "post":
+        # Estrutura fixa: capa e slides 2, 3, 4 e 8 levam imagem; os demais
+        # sao de texto puro de proposito, para o carrossel ter respiro.
+        posicoes = [0, 1, 2, 3, 7]
+        alvos = [slides[i] for i in posicoes if i < len(slides)]
+        for indice, (slide, image) in enumerate(zip(alvos, images)):
+            chave = "artImage" if slide.get("type") == "cover" else "image"
+            slide[chave] = str(image)
+            if indice < len(captions) and captions[indice]:
+                slide["imageCaption"] = captions[indice]
+        return deck
+
+    targets = [s for s in slides if s.get("type") == "text"]
     for slide, image in zip(targets, images):
         slide["image"] = str(image)
         index = images.index(image)
@@ -281,7 +410,8 @@ def describe_frames(images: list) -> str:
         return ""
 
 
-def build_deck(source: dict, status: str = "conceito", screens: str = "") -> dict:
+def build_deck(source: dict, status: str = "conceito", screens: str = "",
+               template: str = "blueprint") -> dict:
     """source: {text, author, url, views, likes}. status: confirmado|conceito|duvidoso."""
     import llm_client
 
@@ -298,7 +428,8 @@ def build_deck(source: dict, status: str = "conceito", screens: str = "") -> dic
             "Use como dado da materia — nunca descreva a tela nem diga onde apareceu:\n"
             f"{screens}\n\n"
         )
-    prompt += f"Formato exato de saida:\n{SCHEMA_HINT}"
+    esquema = SCHEMA_POST if str(template).lower() == "post" else SCHEMA_HINT
+    prompt += f"Formato exato de saida:\n{esquema}"
 
-    deck = llm_client.chat_json(prompt, system=_rules(status))
-    return _finish(_sanitize(deck), source)
+    deck = llm_client.chat_json(prompt, system=_rules(status, template))
+    return _finish(_sanitize(deck, template), source)
